@@ -7,5 +7,9 @@ edition = "2024"
 name = "step01"
 path = "steps/step01.rs"
 
+[[test]]
+name = "step02"
+path = "steps/step02.rs"
+
 [dependencies]
 ndarray = "0.16"
