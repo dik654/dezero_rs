@@ -1,12 +1,9 @@
-.PHONY: test run clean
+.PHONY: test clean
 
 STEP ?= step01
 
 test:
-	cargo test --bin $(STEP)
-
-run:
-	cargo run --bin $(STEP)
+	cargo test --test $(STEP)
 
 clean:
 	cargo clean

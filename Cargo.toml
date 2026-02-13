@@ -3,8 +3,9 @@ name = "dezero"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
+[[test]]
 name = "step01"
 path = "steps/step01.rs"
 
 [dependencies]
+ndarray = "0.16"
