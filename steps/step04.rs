@@ -73,7 +73,7 @@ mod tests {
             }
         }
 
-        // 합성함수 결과 (exp^x^2)^2
+        // 합성함수 결과 (exp(x^2))^2
         let f = ComposedFn;
         // 합성함수 미분
         let dy = numerical_diff(&f, &x, 1e-4);
