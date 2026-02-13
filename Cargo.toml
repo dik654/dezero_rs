@@ -1,0 +1,10 @@
+[package]
+name = "dezero"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "step01"
+path = "steps/step01.rs"
+
+[dependencies]
