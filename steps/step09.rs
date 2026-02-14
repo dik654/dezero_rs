@@ -60,7 +60,7 @@ impl Variable {
         while let Some(state_ref) = funcs.pop() {
             let (gx, input) = {
                 let state = state_ref.borrow();
-                // f.output에서 grad를 가져온다
+                // f.output에서 기울기를 가져온다
                 let output = state.output.as_ref().unwrap();
                 let gy = output.inner.borrow().grad.clone().unwrap();
                 // f.input에서 입력 변수와 데이터를 가져온다
