@@ -1,6 +1,6 @@
-// step21: 연산자 오버로딩 확장
-// step20의 +, * 에 더해 -(부정), -(뺄셈), /(나눗셈), pow(거듭제곱) 추가
-// 스칼라(f64)와의 연산도 지원: &x + 2.0, 3.0 * &x 등
+// step21: 연산자 오버로딩 (2)
+// step20의 +, * 연산자에 스칼라(f64)와의 연산을 추가한다
+// Python의 __radd__, __rmul__ 에 해당: 3.0 * x + 1.0 같은 수식 지원
 
 use ndarray::ArrayD;
 use std::cell::{Cell, RefCell};
@@ -104,11 +104,6 @@ impl Variable {
         self.inner.borrow_mut().grad = None;
     }
 
-    /// 거듭제곱 (Rust에는 ** 연산자가 없으므로 메서드로 제공)
-    fn pow(&self, c: f64) -> Variable {
-        powfn(self, c)
-    }
-
     fn backward(&self, retain_grad: bool) {
         {
             let mut inner = self.inner.borrow_mut();
@@ -193,15 +188,7 @@ impl fmt::Display for Variable {
 
 // Variable 간 연산
 
-/// -&x (부정)
-impl std::ops::Neg for &Variable {
-    type Output = Variable;
-    fn neg(self) -> Variable {
-        neg(self)
-    }
-}
-
-/// &x + &y
+/// &x + &y (Python의 __add__)
 impl std::ops::Add for &Variable {
     type Output = Variable;
     fn add(self, rhs: Self) -> Variable {
@@ -209,15 +196,7 @@ impl std::ops::Add for &Variable {
     }
 }
 
-/// &x - &y
-impl std::ops::Sub for &Variable {
-    type Output = Variable;
-    fn sub(self, rhs: Self) -> Variable {
-        sub(self, rhs)
-    }
-}
-
-/// &x * &y
+/// &x * &y (Python의 __mul__)
 impl std::ops::Mul for &Variable {
     type Output = Variable;
     fn mul(self, rhs: Self) -> Variable {
@@ -225,18 +204,11 @@ impl std::ops::Mul for &Variable {
     }
 }
 
-/// &x / &y
-impl std::ops::Div for &Variable {
-    type Output = Variable;
-    fn div(self, rhs: Self) -> Variable {
-        div(self, rhs)
-    }
-}
-
 // 스칼라(f64)와의 연산
+// Python의 __radd__, __rmul__ 에 해당
 // f64를 Variable로 감싸서 기존 함수를 재활용
-// 좌우 순서를 둘 다 지원
-/// &x + 2.0
+
+/// &x + 2.0 (Python의 __add__)
 impl std::ops::Add<f64> for &Variable {
     type Output = Variable;
     fn add(self, rhs: f64) -> Variable {
@@ -245,7 +217,7 @@ impl std::ops::Add<f64> for &Variable {
     }
 }
 
-/// 2.0 + &x
+/// 2.0 + &x (Python의 __radd__)
 impl std::ops::Add<&Variable> for f64 {
     type Output = Variable;
     fn add(self, rhs: &Variable) -> Variable {
@@ -254,25 +226,7 @@ impl std::ops::Add<&Variable> for f64 {
     }
 }
 
-/// &x - 2.0
-impl std::ops::Sub<f64> for &Variable {
-    type Output = Variable;
-    fn sub(self, rhs: f64) -> Variable {
-        let rhs = Variable::new(ndarray::arr0(rhs).into_dyn());
-        sub(self, &rhs)
-    }
-}
-
-/// 2.0 - &x
-impl std::ops::Sub<&Variable> for f64 {
-    type Output = Variable;
-    fn sub(self, rhs: &Variable) -> Variable {
-        let lhs = Variable::new(ndarray::arr0(self).into_dyn());
-        sub(&lhs, rhs)
-    }
-}
-
-/// &x * 2.0
+/// &x * 2.0 (Python의 __mul__)
 impl std::ops::Mul<f64> for &Variable {
     type Output = Variable;
     fn mul(self, rhs: f64) -> Variable {
@@ -281,30 +235,12 @@ impl std::ops::Mul<f64> for &Variable {
     }
 }
 
-/// 2.0 * &x
+/// 2.0 * &x (Python의 __rmul__)
 impl std::ops::Mul<&Variable> for f64 {
     type Output = Variable;
     fn mul(self, rhs: &Variable) -> Variable {
         let lhs = Variable::new(ndarray::arr0(self).into_dyn());
         mul(&lhs, rhs)
-    }
-}
-
-/// &x / 2.0
-impl std::ops::Div<f64> for &Variable {
-    type Output = Variable;
-    fn div(self, rhs: f64) -> Variable {
-        let rhs = Variable::new(ndarray::arr0(rhs).into_dyn());
-        div(self, &rhs)
-    }
-}
-
-/// 2.0 / &x
-impl std::ops::Div<&Variable> for f64 {
-    type Output = Variable;
-    fn div(self, rhs: &Variable) -> Variable {
-        let lhs = Variable::new(ndarray::arr0(self).into_dyn());
-        div(&lhs, rhs)
     }
 }
 
@@ -362,32 +298,6 @@ impl Func {
 
 // --- 함수 구현 ---
 
-struct Square;
-
-impl Function for Square {
-    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![&xs[0] * &xs[0]]
-    }
-
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![2.0 * &xs[0] * &gys[0]]
-    }
-}
-
-/// 부정: y = -x
-/// backward: dy/dx = -1
-struct NegFn;
-
-impl Function for NegFn {
-    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![-&xs[0]]
-    }
-
-    fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![-&gys[0]]
-    }
-}
-
 /// 덧셈: y = x0 + x1
 struct AddFn;
 
@@ -401,22 +311,8 @@ impl Function for AddFn {
     }
 }
 
-/// 뺄셈: y = x0 - x1
-/// backward: dy/dx0 = 1, dy/dx1 = -1
-struct SubFn;
-
-impl Function for SubFn {
-    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![&xs[0] - &xs[1]]
-    }
-
-    fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![gys[0].clone(), -&gys[0]]
-    }
-}
-
 /// 곱셈: y = x0 * x1
-/// backward: dy/dx0 = x1, dy/dx1 = x0
+/// backward: dy/dx0 = x1, dy/dx1 = x0 (곱의 미분)
 struct MulFn;
 
 impl Function for MulFn {
@@ -429,65 +325,12 @@ impl Function for MulFn {
     }
 }
 
-/// 나눗셈: y = x0 / x1
-/// backward: dy/dx0 = 1/x1, dy/dx1 = -x0/x1²
-struct DivFn;
-
-impl Function for DivFn {
-    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![&xs[0] / &xs[1]]
-    }
-
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        let gx0 = &gys[0] / &xs[1];
-        let gx1 = -&gys[0] * &xs[0] / (&xs[1] * &xs[1]);
-        vec![gx0, gx1]
-    }
-}
-
-/// 거듭제곱: y = x^c (c는 상수)
-/// backward: dy/dx = c * x^(c-1)
-struct PowFn {
-    c: f64,
-}
-
-impl Function for PowFn {
-    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![xs[0].mapv(|x| x.powf(self.c))]
-    }
-
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        let c = self.c;
-        vec![c * &xs[0].mapv(|x| x.powf(c - 1.0)) * &gys[0]]
-    }
-}
-
-fn square(x: &Variable) -> Variable {
-    Func::new(Square).call(&[x])
-}
-
-fn neg(x: &Variable) -> Variable {
-    Func::new(NegFn).call(&[x])
-}
-
 fn add(x0: &Variable, x1: &Variable) -> Variable {
     Func::new(AddFn).call(&[x0, x1])
 }
 
-fn sub(x0: &Variable, x1: &Variable) -> Variable {
-    Func::new(SubFn).call(&[x0, x1])
-}
-
 fn mul(x0: &Variable, x1: &Variable) -> Variable {
     Func::new(MulFn).call(&[x0, x1])
-}
-
-fn div(x0: &Variable, x1: &Variable) -> Variable {
-    Func::new(DivFn).call(&[x0, x1])
-}
-
-fn powfn(x: &Variable, c: f64) -> Variable {
-    Func::new(PowFn { c }).call(&[x])
 }
 
 #[cfg(test)]
@@ -503,77 +346,59 @@ mod tests {
         *v.inner.borrow().grad.as_ref().unwrap().first().unwrap()
     }
 
-    /// 부정: y = -x
+    /// Python: y = x + np.array(3.0)
     #[test]
-    fn test_neg() {
-        let x = Variable::new(arr0(3.0).into_dyn());
-        let y = -&x;
-        y.backward(false);
-        assert_eq!(get_val(&y), -3.0);
-        assert_eq!(get_grad(&x), -1.0);
-    }
-
-    /// 뺄셈: y = a - b
-    #[test]
-    fn test_sub() {
-        let a = Variable::new(arr0(5.0).into_dyn());
-        let b = Variable::new(arr0(3.0).into_dyn());
-        let y = &a - &b;
-        y.backward(false);
-        assert_eq!(get_val(&y), 2.0);
-        assert_eq!(get_grad(&a), 1.0);
-        assert_eq!(get_grad(&b), -1.0);
-    }
-
-    /// 나눗셈: y = a / b
-    #[test]
-    fn test_div() {
-        let a = Variable::new(arr0(6.0).into_dyn());
-        let b = Variable::new(arr0(3.0).into_dyn());
-        let y = &a / &b;
-        y.backward(false);
-        assert_eq!(get_val(&y), 2.0);
-        // dy/da = 1/b = 1/3
-        assert!((get_grad(&a) - 1.0 / 3.0).abs() < 1e-10);
-        // dy/db = -a/b² = -6/9 = -2/3
-        assert!((get_grad(&b) - (-2.0 / 3.0)).abs() < 1e-10);
-    }
-
-    /// 거듭제곱: y = x^3
-    #[test]
-    fn test_pow() {
+    fn test_add_with_array() {
         let x = Variable::new(arr0(2.0).into_dyn());
-        let y = x.pow(3.0);
-        y.backward(false);
-        assert_eq!(get_val(&y), 8.0);
-        // dy/dx = 3x² = 12
-        assert_eq!(get_grad(&x), 12.0);
-    }
-
-    /// 스칼라 연산: &x + 2.0, 3.0 * &x 등
-    #[test]
-    fn test_scalar_ops() {
-        let x = Variable::new(arr0(3.0).into_dyn());
-
-        assert_eq!(get_val(&(&x + 1.0)), 4.0);
-        assert_eq!(get_val(&(1.0 + &x)), 4.0);
-        assert_eq!(get_val(&(&x - 1.0)), 2.0);
-        assert_eq!(get_val(&(10.0 - &x)), 7.0);
-        assert_eq!(get_val(&(&x * 2.0)), 6.0);
-        assert_eq!(get_val(&(2.0 * &x)), 6.0);
-        assert_eq!(get_val(&(&x / 2.0)), 1.5);
-        assert_eq!(get_val(&(6.0 / &x)), 2.0);
-    }
-
-    /// 복합 수식: y = x^3 - 2*x + 1 의 역전파
-    #[test]
-    fn test_complex_expression() {
-        let x = Variable::new(arr0(2.0).into_dyn());
-        // y = x³ - 2x + 1 = 8 - 4 + 1 = 5
-        let y = &(&x.pow(3.0) - &(&x * 2.0)) + &Variable::new(arr0(1.0).into_dyn());
-        y.backward(false);
+        let y = &x + 3.0;
         assert_eq!(get_val(&y), 5.0);
-        // dy/dx = 3x² - 2 = 12 - 2 = 10
-        assert_eq!(get_grad(&x), 10.0);
+    }
+
+    /// Python: y = x + 3.0
+    #[test]
+    fn test_add_with_scalar() {
+        let x = Variable::new(arr0(2.0).into_dyn());
+        let y = &x + 3.0;
+        assert_eq!(get_val(&y), 5.0);
+    }
+
+    /// Python: y = 3.0 * x + 1.0
+    #[test]
+    fn test_scalar_expression() {
+        let x = Variable::new(arr0(2.0).into_dyn());
+        // y = 3.0 * x + 1.0 = 7.0
+        let y = &(3.0 * &x) + 1.0;
+        y.backward(false);
+
+        assert_eq!(get_val(&y), 7.0);
+        // dy/dx = 3.0
+        assert_eq!(get_grad(&x), 3.0);
+    }
+
+    /// 스칼라가 왼쪽/오른쪽 어디에 와도 동작 (__radd__, __rmul__)
+    #[test]
+    fn test_scalar_both_sides() {
+        let x = Variable::new(arr0(2.0).into_dyn());
+
+        // Variable + scalar
+        assert_eq!(get_val(&(&x + 3.0)), 5.0);
+        // scalar + Variable
+        assert_eq!(get_val(&(3.0 + &x)), 5.0);
+        // Variable * scalar
+        assert_eq!(get_val(&(&x * 3.0)), 6.0);
+        // scalar * Variable
+        assert_eq!(get_val(&(3.0 * &x)), 6.0);
+    }
+
+    /// 곱셈 역전파
+    #[test]
+    fn test_mul_backward() {
+        let a = Variable::new(arr0(3.0).into_dyn());
+        let b = Variable::new(arr0(2.0).into_dyn());
+        let y = &a * &b;
+        y.backward(false);
+
+        assert_eq!(get_grad(&a), 2.0); // dy/da = b
+        assert_eq!(get_grad(&b), 3.0); // dy/db = a
     }
 }
