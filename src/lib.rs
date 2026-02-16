@@ -457,6 +457,18 @@ impl Function for PowFn {
     fn name(&self) -> &str { "Pow" }
 }
 
+struct SinFn;
+
+impl Function for SinFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(f64::sin)]
+    }
+    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![&xs[0].mapv(f64::cos) * &gys[0]]
+    }
+    fn name(&self) -> &str { "Sin" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -481,6 +493,10 @@ pub fn div(x0: &Variable, x1: &Variable) -> Variable {
 
 pub fn powfn(x: &Variable, c: f64) -> Variable {
     Func::new(PowFn { c }).call(&[x])
+}
+
+pub fn sin(x: &Variable) -> Variable {
+    Func::new(SinFn).call(&[x])
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
