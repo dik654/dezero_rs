@@ -23,7 +23,7 @@ mod tests {
     fn test_package_example() {
         let x = Variable::new(ndarray::arr0(1.0).into_dyn());
         let y = (&x + 3.0).pow(2.0);
-        y.backward(false);
+        y.backward(false, false);
 
         assert_eq!(get_val(&y), 16.0);
         assert_eq!(get_grad(&x), 8.0);

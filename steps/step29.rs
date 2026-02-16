@@ -34,7 +34,7 @@ mod tests {
 
             let y = f(&x);
             x.cleargrad();
-            y.backward(false);
+            y.backward(false, false);
 
             let grad = x.grad().unwrap();
             x.set_data(x.data() - &grad / &gx2(&x.data()));

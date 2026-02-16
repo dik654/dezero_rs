@@ -33,7 +33,7 @@ mod tests {
     fn test_sin() {
         let x = Variable::new(ndarray::arr0(std::f64::consts::FRAC_PI_4).into_dyn());
         let y = sin(&x);
-        y.backward(false);
+        y.backward(false, false);
 
         println!("--- original sin ---");
         println!("{:?}", y.data());
@@ -50,7 +50,7 @@ mod tests {
     fn test_my_sin() {
         let x = Variable::new(ndarray::arr0(std::f64::consts::FRAC_PI_4).into_dyn());
         let y = my_sin(&x, 0.0001);
-        y.backward(false);
+        y.backward(false, false);
 
         println!("--- approximate sin ---");
         println!("{:?}", y.data());
@@ -67,7 +67,7 @@ mod tests {
     fn test_plot_my_sin() {
         let x = Variable::new(ndarray::arr0(std::f64::consts::FRAC_PI_4).into_dyn());
         let y = my_sin(&x, 0.0001);
-        y.backward(false);
+        y.backward(false, false);
 
         x.set_name("x");
         y.set_name("y");

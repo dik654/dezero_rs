@@ -32,6 +32,14 @@ impl Drop for NoGradGuard {
     }
 }
 
+/// Python의 using_config('enable_backprop', value)에 해당
+/// 역전파 그래프 생성을 enable 값으로 설정하고, 스코프 종료 시 이전 값 복원
+fn using_backprop(enable: bool) -> NoGradGuard {
+    let prev = ENABLE_BACKPROP.with(|c| c.get());
+    ENABLE_BACKPROP.with(|c| c.set(enable));
+    NoGradGuard { prev }
+}
+
 // --- 핵심 구조체 ---
 
 struct FuncState {
@@ -45,7 +53,20 @@ type FuncStateRef = Rc<RefCell<FuncState>>;
 
 struct VarInner {
     data: ArrayD<f64>,
-    grad: Option<ArrayD<f64>>,
+    // ArrayD가 아닌 Variable로 저장하는 이유:
+    // 기울기도 cos, mul 같은 연산을 거쳐 만들어진 값
+    // 그 연산 이력(creator 체인)을 보존해야 다시 미분할 수 있다
+    //
+    // 예) f(x) = x^4 - 2x^2, x = 2.0
+    //
+    //   ArrayD일 때는 단순히 숫자 값만 가지고 있어 문맥 정보가 없음:  x.grad = 24.0 
+    //   Variable일 때: x.grad = Variable {
+    //                    data: 24.0,
+    //                    creator: SubFn ← MulFn ← PowFn ← x
+    //                  }
+    //                  → "24.0은 4x³-4x를 계산해서 나온 값"이라는 정보가 남아있음
+    //                  → grad.backward() 하면 이 체인을 따라 f''(x) = 12x²-4 자동 계산
+    grad: Option<Variable>,
     creator: Option<FuncStateRef>,
     generation: u32,
     name: Option<String>,
@@ -91,7 +112,15 @@ impl Variable {
         self.inner.borrow().data.clone()
     }
 
+    /// 기울기를 ArrayD로 반환 (하위 호환성)
     pub fn grad(&self) -> Option<ArrayD<f64>> {
+        // Variable에서 data만 추출
+        self.inner.borrow().grad.as_ref().map(|g| g.data())
+    }
+
+    /// 기울기를 Variable로 반환 (이중 역전파용)
+    pub fn grad_var(&self) -> Option<Variable> {
+        // 같은 Variable 데이터를 가리키는 포인터
         self.inner.borrow().grad.clone()
     }
 
@@ -137,11 +166,11 @@ impl Variable {
         self.inner.borrow_mut().grad = None;
     }
 
-    pub fn backward(&self, retain_grad: bool) {
+    pub fn backward(&self, retain_grad: bool, create_graph: bool) {
         {
             let mut inner = self.inner.borrow_mut();
             if inner.grad.is_none() {
-                inner.grad = Some(ArrayD::ones(inner.data.shape()));
+                inner.grad = Some(Variable::new(ArrayD::ones(inner.data.shape())));
             }
         }
 
@@ -164,22 +193,39 @@ impl Variable {
         }
 
         while let Some(state_ref) = funcs.pop() {
-            let (gxs, inputs) = {
-                let state = state_ref.borrow();
-                let gys: Vec<ArrayD<f64>> = state
-                    .outputs
-                    .iter()
-                    .map(|o| o.upgrade().unwrap().borrow().grad.clone().unwrap())
-                    .collect();
-                let xs: Vec<ArrayD<f64>> = state
-                    .inputs
-                    .iter()
-                    .map(|i| i.inner.borrow().data.clone())
-                    .collect();
-                let inputs = state.inputs.clone();
-                let gxs = state.func.backward(&xs, &gys);
-                (gxs, inputs)
-            };
+            {
+                // using_config('enable_backprop', create_graph)
+                // create_graph=true: 역전파 계산도 그래프에 기록 (이중 역전파 가능)
+                // create_graph=false: 역전파 계산 시 그래프 생성 비활성화
+                let _guard = using_backprop(create_graph);
+
+                let (gxs, inputs) = {
+                    let state = state_ref.borrow();
+                    let gys: Vec<Variable> = state
+                        .outputs
+                        .iter()
+                        .map(|o| o.upgrade().unwrap().borrow().grad.clone().unwrap())
+                        .collect();
+                    let xs: Vec<Variable> = state.inputs.clone();
+                    let inputs = state.inputs.clone();
+                    let gxs = state.func.backward(&xs, &gys);
+                    (gxs, inputs)
+                };
+
+                for (input, gx) in inputs.iter().zip(gxs) {
+                    let mut inner = input.inner.borrow_mut();
+                    if inner.grad.is_none() {
+                        inner.grad = Some(gx);
+                    } else {
+                        let prev = inner.grad.take().unwrap();
+                        inner.grad = Some(&prev + &gx);
+                    }
+                    drop(inner);
+                    if let Some(creator) = input.inner.borrow().creator.clone() {
+                        add_func(creator, &mut funcs, &mut seen);
+                    }
+                }
+            }
 
             if !retain_grad {
                 let state = state_ref.borrow();
@@ -187,19 +233,6 @@ impl Variable {
                     if let Some(out) = output.upgrade() {
                         out.borrow_mut().grad = None;
                     }
-                }
-            }
-
-            for (input, gx) in inputs.iter().zip(gxs) {
-                let mut inner = input.inner.borrow_mut();
-                if inner.grad.is_none() {
-                    inner.grad = Some(gx);
-                } else {
-                    inner.grad = Some(inner.grad.as_ref().unwrap() + &gx);
-                }
-                drop(inner);
-                if let Some(creator) = input.inner.borrow().creator.clone() {
-                    add_func(creator, &mut funcs, &mut seen);
                 }
             }
         }
@@ -328,7 +361,7 @@ impl std::ops::Div<&Variable> for f64 {
 
 pub trait Function {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>>;
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>>;
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable>;
     /// Python의 type(f).__class__.__name__ 에 해당
     fn name(&self) -> &str {
         "Function"
@@ -390,8 +423,8 @@ impl Function for NegFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![-&xs[0]]
     }
-    fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![-&gys[0]]
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![neg(&gys[0])]
     }
     fn name(&self) -> &str { "Neg" }
 }
@@ -402,7 +435,7 @@ impl Function for AddFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] + &xs[1]]
     }
-    fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
         vec![gys[0].clone(), gys[0].clone()]
     }
     fn name(&self) -> &str { "Add" }
@@ -414,8 +447,8 @@ impl Function for SubFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] - &xs[1]]
     }
-    fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![gys[0].clone(), -&gys[0]]
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![gys[0].clone(), neg(&gys[0])]
     }
     fn name(&self) -> &str { "Sub" }
 }
@@ -426,7 +459,7 @@ impl Function for MulFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] * &xs[1]]
     }
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
         vec![&xs[1] * &gys[0], &xs[0] * &gys[0]]
     }
     fn name(&self) -> &str { "Mul" }
@@ -438,9 +471,9 @@ impl Function for DivFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] / &xs[1]]
     }
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
         let gx0 = &gys[0] / &xs[1];
-        let gx1 = -&gys[0] * &xs[0] / (&xs[1] * &xs[1]);
+        let gx1 = &(&neg(&gys[0]) * &xs[0]) / &(&xs[1] * &xs[1]);
         vec![gx0, gx1]
     }
     fn name(&self) -> &str { "Div" }
@@ -454,9 +487,9 @@ impl Function for PowFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![xs[0].mapv(|x| x.powf(self.c))]
     }
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
         let c = self.c;
-        vec![c * &xs[0].mapv(|x| x.powf(c - 1.0)) * &gys[0]]
+        vec![&(c * &xs[0].pow(c - 1.0)) * &gys[0]]
     }
     fn name(&self) -> &str { "Pow" }
 }
@@ -467,10 +500,22 @@ impl Function for SinFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![xs[0].mapv(f64::sin)]
     }
-    fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![&xs[0].mapv(f64::cos) * &gys[0]]
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![&cos(&xs[0]) * &gys[0]]
     }
     fn name(&self) -> &str { "Sin" }
+}
+
+struct CosFn;
+
+impl Function for CosFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(f64::cos)]
+    }
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![&neg(&sin(&xs[0])) * &gys[0]]
+    }
+    fn name(&self) -> &str { "Cos" }
 }
 
 // --- 공개 함수 ---
@@ -501,6 +546,10 @@ pub fn powfn(x: &Variable, c: f64) -> Variable {
 
 pub fn sin(x: &Variable) -> Variable {
     Func::new(SinFn).call(&[x])
+}
+
+pub fn cos(x: &Variable) -> Variable {
+    Func::new(CosFn).call(&[x])
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---

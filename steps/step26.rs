@@ -41,7 +41,7 @@ mod tests {
         let x = Variable::new(ndarray::arr0(1.0).into_dyn());
         let y = Variable::new(ndarray::arr0(1.0).into_dyn());
         let z = goldstein(&x, &y);
-        z.backward(false);
+        z.backward(false, false);
 
         x.set_name("x");
         y.set_name("y");

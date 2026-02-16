@@ -68,7 +68,7 @@ mod tests {
         let x = Variable::new(ndarray::arr0(1.0).into_dyn());
         let y = Variable::new(ndarray::arr0(1.0).into_dyn());
         let z = sphere(&x, &y);
-        z.backward(false);
+        z.backward(false, false);
 
         assert_eq!(get_grad(&x), 2.0);
         assert_eq!(get_grad(&y), 2.0);
@@ -82,7 +82,7 @@ mod tests {
         let x = Variable::new(ndarray::arr0(1.0).into_dyn());
         let y = Variable::new(ndarray::arr0(2.0).into_dyn());
         let z = matyas(&x, &y);
-        z.backward(false);
+        z.backward(false, false);
 
         assert!((get_grad(&x) - (-0.44)).abs() < 1e-10);
         assert!((get_grad(&y) - 0.56).abs() < 1e-10);
@@ -94,7 +94,7 @@ mod tests {
         let x = Variable::new(ndarray::arr0(1.0).into_dyn());
         let y = Variable::new(ndarray::arr0(1.0).into_dyn());
         let z = goldstein(&x, &y);
-        z.backward(false);
+        z.backward(false, false);
 
         assert_eq!(get_grad(&x), -5376.0);
         assert_eq!(get_grad(&y), 8064.0);

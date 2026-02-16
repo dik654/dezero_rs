@@ -31,7 +31,7 @@ mod tests {
 
             x0.cleargrad();
             x1.cleargrad();
-            y.backward(false);
+            y.backward(false, false);
 
             let g0 = x0.grad().unwrap();
             let g1 = x1.grad().unwrap();
