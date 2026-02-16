@@ -518,6 +518,20 @@ impl Function for CosFn {
     fn name(&self) -> &str { "Cos" }
 }
 
+struct TanhFn;
+
+impl Function for TanhFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(f64::tanh)]
+    }
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let y: Variable = tanh(&xs[0]);
+        // tanh(x)의 미분은 tanh'(x) = 1 - tanh(x)^2
+        vec![&gys[0] * &(1.0 - &(&y * &y))]
+    }
+    fn name(&self) -> &str { "Tanh" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -550,6 +564,10 @@ pub fn sin(x: &Variable) -> Variable {
 
 pub fn cos(x: &Variable) -> Variable {
     Func::new(CosFn).call(&[x])
+}
+
+pub fn tanh(x: &Variable) -> Variable {
+    Func::new(TanhFn).call(&[x])
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---

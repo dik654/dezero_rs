@@ -107,5 +107,9 @@ path = "steps/step33.rs"
 name = "step34"
 path = "steps/step34.rs"
 
+[[test]]
+name = "step35"
+path = "steps/step35.rs"
+
 [dependencies]
 ndarray = "0.16"
