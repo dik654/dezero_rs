@@ -95,6 +95,10 @@ impl Variable {
         self.inner.borrow().grad.clone()
     }
 
+    pub fn set_data(&self, data: ArrayD<f64>) {
+        self.inner.borrow_mut().data = data;
+    }
+
     // --- 형상 정보 ---
 
     pub fn shape(&self) -> Vec<usize> {
