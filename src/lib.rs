@@ -81,6 +81,10 @@ impl Variable {
         }
     }
 
+    pub fn set_name(&self, name: &str) {
+        self.inner.borrow_mut().name = Some(name.to_string());
+    }
+
     // --- 데이터 접근 ---
 
     pub fn data(&self) -> ArrayD<f64> {
@@ -321,6 +325,10 @@ impl std::ops::Div<&Variable> for f64 {
 pub trait Function {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>>;
     fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>>;
+    /// Python의 type(f).__class__.__name__ 에 해당
+    fn name(&self) -> &str {
+        "Function"
+    }
 }
 
 pub struct Func {
@@ -378,10 +386,10 @@ impl Function for NegFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![-&xs[0]]
     }
-
     fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![-&gys[0]]
     }
+    fn name(&self) -> &str { "Neg" }
 }
 
 struct AddFn;
@@ -390,10 +398,10 @@ impl Function for AddFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] + &xs[1]]
     }
-
     fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![gys[0].clone(), gys[0].clone()]
     }
+    fn name(&self) -> &str { "Add" }
 }
 
 struct SubFn;
@@ -402,10 +410,10 @@ impl Function for SubFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] - &xs[1]]
     }
-
     fn backward(&self, _xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![gys[0].clone(), -&gys[0]]
     }
+    fn name(&self) -> &str { "Sub" }
 }
 
 struct MulFn;
@@ -414,10 +422,10 @@ impl Function for MulFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] * &xs[1]]
     }
-
     fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[1] * &gys[0], &xs[0] * &gys[0]]
     }
+    fn name(&self) -> &str { "Mul" }
 }
 
 struct DivFn;
@@ -426,12 +434,12 @@ impl Function for DivFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] / &xs[1]]
     }
-
     fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         let gx0 = &gys[0] / &xs[1];
         let gx1 = -&gys[0] * &xs[0] / (&xs[1] * &xs[1]);
         vec![gx0, gx1]
     }
+    fn name(&self) -> &str { "Div" }
 }
 
 struct PowFn {
@@ -442,11 +450,11 @@ impl Function for PowFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![xs[0].mapv(|x| x.powf(self.c))]
     }
-
     fn backward(&self, xs: &[ArrayD<f64>], gys: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         let c = self.c;
         vec![c * &xs[0].mapv(|x| x.powf(c - 1.0)) * &gys[0]]
     }
+    fn name(&self) -> &str { "Pow" }
 }
 
 // --- 공개 함수 ---
@@ -473,4 +481,111 @@ pub fn div(x0: &Variable, x1: &Variable) -> Variable {
 
 pub fn powfn(x: &Variable, c: f64) -> Variable {
     Func::new(PowFn { c }).call(&[x])
+}
+
+// --- 계산 그래프 시각화 (DOT/Graphviz) ---
+
+/// Variable 노드의 DOT 표현
+fn dot_var(v: &Variable, verbose: bool) -> String {
+    let inner = v.inner.borrow();
+    let id = Rc::as_ptr(&v.inner) as usize;
+    let mut label = inner.name.clone().unwrap_or_default();
+    if verbose {
+        if inner.name.is_some() {
+            label.push_str(": ");
+        }
+        label.push_str(&format!("{:?} f64", inner.data.shape()));
+    }
+    format!(
+        "{} [label=\"{}\", color=orange, style=filled]\n",
+        id, label
+    )
+}
+
+/// Function 노드의 DOT 표현 (노드 + 입출력 엣지)
+fn dot_func(state: &FuncState, state_ptr: usize) -> String {
+    let mut txt = format!(
+        "{} [label=\"{}\", color=lightblue, style=filled, shape=box]\n",
+        state_ptr,
+        state.func.name()
+    );
+    for input in &state.inputs {
+        let input_id = Rc::as_ptr(&input.inner) as usize;
+        txt.push_str(&format!("{} -> {}\n", input_id, state_ptr));
+    }
+    for output in &state.outputs {
+        if let Some(out) = output.upgrade() {
+            let output_id = Rc::as_ptr(&out) as usize;
+            txt.push_str(&format!("{} -> {}\n", state_ptr, output_id));
+        }
+    }
+    txt
+}
+
+/// 계산 그래프를 DOT 형식 문자열로 변환
+/// Python의 get_dot_graph에 해당
+pub fn get_dot_graph(output: &Variable, verbose: bool) -> String {
+    let mut txt = String::new();
+    let mut funcs: Vec<FuncStateRef> = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+
+    let add_func = |f: FuncStateRef, funcs: &mut Vec<FuncStateRef>, seen: &mut HashSet<usize>| {
+        let ptr = Rc::as_ptr(&f) as usize;
+        if !seen.contains(&ptr) {
+            seen.insert(ptr);
+            funcs.push(f);
+            funcs.sort_by_key(|f| f.borrow().generation);
+        }
+    };
+
+    txt.push_str(&dot_var(output, verbose));
+
+    if let Some(creator) = output.inner.borrow().creator.clone() {
+        add_func(creator, &mut funcs, &mut seen);
+    }
+
+    while let Some(state_ref) = funcs.pop() {
+        let state = state_ref.borrow();
+        let state_ptr = Rc::as_ptr(&state_ref) as usize;
+        txt.push_str(&dot_func(&state, state_ptr));
+
+        for input in &state.inputs {
+            txt.push_str(&dot_var(input, verbose));
+            if let Some(creator) = input.inner.borrow().creator.clone() {
+                add_func(creator, &mut funcs, &mut seen);
+            }
+        }
+    }
+
+    format!("digraph g {{\n{}}}", txt)
+}
+
+/// DOT 그래프를 파일로 저장하고 Graphviz로 이미지 생성
+/// Python의 plot_dot_graph에 해당
+pub fn plot_dot_graph(output: &Variable, verbose: bool, to_file: &str) -> std::io::Result<()> {
+    let dot = get_dot_graph(output, verbose);
+
+    // .dot 파일 경로 생성
+    let dot_file = if let Some(stem) = to_file.strip_suffix(".png") {
+        format!("{}.dot", stem)
+    } else if let Some(stem) = to_file.strip_suffix(".pdf") {
+        format!("{}.dot", stem)
+    } else {
+        format!("{}.dot", to_file)
+    };
+
+    std::fs::write(&dot_file, &dot)?;
+
+    // 출력 형식 결정
+    let ext = std::path::Path::new(to_file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png");
+
+    // dot 명령 실행
+    std::process::Command::new("dot")
+        .args([&format!("-T{}", ext), &dot_file, "-o", to_file])
+        .status()?;
+
+    Ok(())
 }
