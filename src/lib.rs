@@ -556,6 +556,56 @@ impl Function for SumFn {
     fn name(&self) -> &str { "Sum" }
 }
 
+// reshape는 값을 바꾸지 않고 shape만 바꾸는 연산
+// 순전파: x (2,3) -> y (6,)   데이터 [0,1,2,3,4,5]는 동일
+// 역전파: 기울기도 값은 그대로, shape만 되돌리면 됨
+//   gys[0] shape (6,) -> gx shape (2,3)
+//   dy/dx_ij = 1 (각 원소가 그대로 출력에 매핑되므로)
+struct ReshapeFn {
+    target_shape: Vec<usize>,
+    // reshape() 호출 시점에 입력의 원래 shape를 캡처해서 여기에 저장한다.
+    // backward에서 이 값으로 기울기를 원래 shape로 되돌린다.
+    x_shape: Vec<usize>,
+}
+
+impl Function for ReshapeFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let reshaped = xs[0].clone()
+            .into_shape_with_order(ndarray::IxDyn(&self.target_shape))
+            .unwrap();
+        vec![reshaped.to_owned()]
+    }
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        // 저장해둔 x_shape로 기울기를 원래 shape로 되돌린다
+        vec![reshape(&gys[0], &self.x_shape)]
+    }
+    fn name(&self) -> &str { "Reshape" }
+}
+
+// transpose는 행과 열을 뒤집는 연산
+// transpose(transpose(x)) = x 이므로 원래 shape를 저장할 필요 없이
+// backward에서 다시 transpose하면 원래 shape로 돌아간다.
+//
+// 순전파: x (2,3) -> y (3,2)
+//   x = [[1,2,3],       y = [[1,4],
+//        [4,5,6]]            [2,5],
+//                             [3,6]]
+//
+// 역전파: gys[0] (3,2) -> transpose -> gx (2,3)
+//   x[0][1]=2 가 y[1][0]=2 로 갔으므로
+//   y[1][0]의 기울기는 x[0][1]의 기울기 -> 다시 transpose하면 원래 위치
+struct TransposeFn;
+
+impl Function for TransposeFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].t().to_owned().into_dyn()]
+    }
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![transpose(&gys[0])]
+    }
+    fn name(&self) -> &str { "Transpose" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -596,6 +646,16 @@ pub fn tanh(x: &Variable) -> Variable {
 
 pub fn sum(x: &Variable) -> Variable {
     Func::new(SumFn).call(&[x])
+}
+
+pub fn reshape(x: &Variable, shape: &[usize]) -> Variable {
+    // 여기서 원래 shape를 캡처해서 ReshapeFn.x_shape에 저장
+    let x_shape = x.shape();
+    Func::new(ReshapeFn { target_shape: shape.to_vec(), x_shape }).call(&[x])
+}
+
+pub fn transpose(x: &Variable) -> Variable {
+    Func::new(TransposeFn).call(&[x])
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
