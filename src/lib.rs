@@ -532,6 +532,30 @@ impl Function for TanhFn {
     fn name(&self) -> &str { "Tanh" }
 }
 
+/// 다차원 배열을 스칼라 하나로 줄이는 연산
+/// AddFn: [1,2,3] + [4,5,6] = [5,7,9]   (shape 유지)
+/// SumFn: [1,2,3,4,5,6] -> 21            (스칼라로 축소)
+struct SumFn;
+
+impl Function for SumFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![ndarray::arr0(xs[0].sum()).into_dyn()]
+    }
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        // xs[0].shape() → 순전파 때 입력의 shape를 가져옴
+        // 예) 입력이 [[1,2,3],[4,5,6]]이었으면 x_shape = [2, 3]
+        let x_shape = xs[0].shape();
+        // 입력과 같은 shape의 1로 채운 배열 생성
+        // ArrayD::ones(IxDyn(&[2, 3])) → [[1,1,1],[1,1,1]]  shape (2,3)
+        let ones = Variable::new(ArrayD::ones(ndarray::IxDyn(&x_shape)));
+        // gys[0]은 스칼라(shape ()), ones는 shape (2,3)
+        // MulFn.forward에서 &xs[0] * &xs[1] 실행 시
+        // ndarray가 스칼라를 자동 브로드캐스팅 → 결과도 shape (2,3)
+        vec![&gys[0] * &ones]
+    }
+    fn name(&self) -> &str { "Sum" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -568,6 +592,10 @@ pub fn cos(x: &Variable) -> Variable {
 
 pub fn tanh(x: &Variable) -> Variable {
     Func::new(TanhFn).call(&[x])
+}
+
+pub fn sum(x: &Variable) -> Variable {
+    Func::new(SumFn).call(&[x])
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
