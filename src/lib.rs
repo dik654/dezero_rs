@@ -691,6 +691,26 @@ impl Function for TransposeFn {
     fn name(&self) -> &str { "Transpose" }
 }
 
+// 행렬곱: y = x @ w
+// 순전파: x (2,3) @ w (3,4) = y (2,4)
+// 역전파: gx = gy @ w^T   (2,4) @ (4,3) = (2,3)
+//         gw = x^T @ gy    (3,2) @ (2,4) = (3,4)
+struct MatMulFn;
+
+impl Function for MatMulFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = xs[0].view().into_dimensionality::<ndarray::Ix2>().unwrap();
+        let w = xs[1].view().into_dimensionality::<ndarray::Ix2>().unwrap();
+        vec![x.dot(&w).into_dyn()]
+    }
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gx = matmul(&gys[0], &transpose(&xs[1])); // gy @ w^T
+        let gw = matmul(&transpose(&xs[0]), &gys[0]);  // x^T @ gy
+        vec![gx, gw]
+    }
+    fn name(&self) -> &str { "MatMul" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -749,6 +769,10 @@ pub fn reshape(x: &Variable, shape: &[usize]) -> Variable {
 
 pub fn transpose(x: &Variable) -> Variable {
     Func::new(TransposeFn).call(&[x])
+}
+
+pub fn matmul(x: &Variable, w: &Variable) -> Variable {
+    Func::new(MatMulFn).call(&[x, w])
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
