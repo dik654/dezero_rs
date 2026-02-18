@@ -532,26 +532,63 @@ impl Function for TanhFn {
     fn name(&self) -> &str { "Tanh" }
 }
 
-/// 다차원 배열을 스칼라 하나로 줄이는 연산
-/// AddFn: [1,2,3] + [4,5,6] = [5,7,9]   (shape 유지)
-/// SumFn: [1,2,3,4,5,6] -> 21            (스칼라로 축소)
-struct SumFn;
+/// 배열의 합산 연산 (axis, keepdims 지원)
+/// axis=None: 전체 합산 → 스칼라        [1,2,3,4,5,6] -> 21
+/// axis=Some(0): 특정 축 방향으로만 합산 → [[1,2,3],[4,5,6]] → [5,7,9]
+/// keepdims=true: 합산 후에도 사라질 축을 제거하지 않고 크기 1로 남겨서 차원 수 유지 → shape (2,3,4,5) → (1,1,1,1)
+struct SumFn {
+    axis: Option<usize>,
+    keepdims: bool,
+    x_shape: Vec<usize>, // backward에서 기울기를 원래 shape로 복원하기 위해 저장
+}
 
 impl Function for SumFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
-        vec![ndarray::arr0(xs[0].sum()).into_dyn()]
+        match self.axis {
+            None => {
+                // 전체 합산 → 스칼라
+                let s = xs[0].sum();
+                // keepdims: 입력과 같은 차원 수를 유지 (각 축 크기 1)
+                if self.keepdims {
+                    // 배열 차원수 가져오기
+                    let ndim = xs[0].ndim();
+                    // 차원 shape 구성
+                    // ndim 차원에 축의 크기가 모두 1
+                    let shape = vec![1; ndim];
+                    // shape와 1차원 Vec을 받아서 배열을 만들기
+                    // ndarray::ArrayD::from_shape_vec(
+                    //     ndarray::IxDyn(&[2, 3]),           // shape: 2행 3열
+                    //     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0] // data: 실제 값
+                    // )
+                    // → [[1, 2, 3],
+                    //    [4, 5, 6]]
+                    vec![ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), vec![s]).unwrap()]
+                } else {
+                    // 단일 스칼라 값으로 
+                    vec![ndarray::arr0(s).into_dyn()]
+                }
+            }
+            Some(axis) => {
+                // 특정 축 방향으로 합산
+                let summed = xs[0].sum_axis(ndarray::Axis(axis));
+                if self.keepdims {
+                    // 합산으로 사라진 축을 크기 1로 다시 삽입
+                    let mut shape: Vec<usize> = summed.shape().to_vec();
+                    shape.insert(axis, 1);
+                    vec![summed.into_shape_with_order(ndarray::IxDyn(&shape)).unwrap()]
+                } else {
+                    vec![summed]
+                }
+            }
+        }
     }
-    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
-        // xs[0].shape() → 순전파 때 입력의 shape를 가져옴
-        // 예) 입력이 [[1,2,3],[4,5,6]]이었으면 x_shape = [2, 3]
-        let x_shape = xs[0].shape();
-        // 입력과 같은 shape의 1로 채운 배열 생성
-        // ArrayD::ones(IxDyn(&[2, 3])) → [[1,1,1],[1,1,1]]  shape (2,3)
-        let ones = Variable::new(ArrayD::ones(ndarray::IxDyn(&x_shape)));
-        // gys[0]은 스칼라(shape ()), ones는 shape (2,3)
-        // MulFn.forward에서 &xs[0] * &xs[1] 실행 시
-        // ndarray가 스칼라를 자동 브로드캐스팅 → 결과도 shape (2,3)
-        vec![&gys[0] * &ones]
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        // 기울기를 원래 입력의 shape로 브로드캐스트
+        let gy = &gys[0];
+        // 기울기의 shape를 입력 shape에 맞게 브로드캐스트 가능한 형태로 변환
+        let gy_data = gy.data();
+        let broadcast = gy_data.broadcast(ndarray::IxDyn(&self.x_shape)).unwrap().to_owned();
+        vec![Variable::new(broadcast)]
     }
     fn name(&self) -> &str { "Sum" }
 }
@@ -644,8 +681,16 @@ pub fn tanh(x: &Variable) -> Variable {
     Func::new(TanhFn).call(&[x])
 }
 
+/// 모든 원소를 더해 스칼라 하나로 만듦
 pub fn sum(x: &Variable) -> Variable {
-    Func::new(SumFn).call(&[x])
+    let x_shape = x.shape();
+    Func::new(SumFn { axis: None, keepdims: false, x_shape }).call(&[x])
+}
+
+/// 옵션 지정 가능
+pub fn sum_with(x: &Variable, axis: Option<usize>, keepdims: bool) -> Variable {
+    let x_shape = x.shape();
+    Func::new(SumFn { axis, keepdims, x_shape }).call(&[x])
 }
 
 pub fn reshape(x: &Variable, shape: &[usize]) -> Variable {
