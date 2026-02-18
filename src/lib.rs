@@ -429,14 +429,58 @@ impl Function for NegFn {
     fn name(&self) -> &str { "Neg" }
 }
 
+// 브로드캐스트 역전파: 기울기를 원래 shape로 축소(기울기는 원래 변수와 같은 shape여야 하기 때문)
+// forward에서 shape (1,) + shape (3,) = shape (3,) 처럼 브로드캐스트되면
+// backward에서 기울기 shape (3,)를 다시 shape (1,)로 줄여야 한다
+//
+// 예시) x=[1,1,1] shape(3,)를 target_shape (1,)로 축소하는 흐름:
+//   x_ndim=1, t_ndim=1
+//   padded_target = [] + [1] = [1]
+//   axis=0: padded[0]=1, result.shape[0]=3 → 합산 → [3] shape(1,)
+//   into_shape_with_order → [3] shape(1,)
+fn sum_to(x: &Variable, target_shape: &[usize]) -> Variable {
+    let x_shape = x.shape();
+    if x_shape == target_shape {
+        return x.clone();
+    }
+    let x_data = x.data();
+    let x_ndim = x_data.ndim();
+    let t_ndim = target_shape.len();
+
+    // target_shape 앞에 1을 채워서 x와 차원 수를 맞춤
+    // 예시) x_ndim=1, t_ndim=1 → 앞에 0개 채움 → padded = [1]
+    let mut padded_target = vec![1usize; x_ndim.saturating_sub(t_ndim)];
+    padded_target.extend_from_slice(target_shape);
+
+    // 각 축을 비교해서, target이 1이고 x가 1이 아닌 축을 합산
+    // 예시) axis=0: padded[0]=1, result.shape[0]=3 → 불일치 → 합산
+    //   [1,1,1] → sum_axis(0) → 3 → insert_axis(0) → [3] shape(1,)
+    let mut result = x_data.clone();
+    for axis in (0..x_ndim).rev() {
+        if padded_target[axis] == 1 && result.shape()[axis] != 1 {
+            // sum_axis: 해당 축 방향으로 합산 (축 제거됨)
+            // insert_axis: 제거된 축을 크기 1로 다시 삽입 (차원 수 유지)
+            result = result.sum_axis(ndarray::Axis(axis)).insert_axis(ndarray::Axis(axis));
+        }
+    }
+    // 최종 shape를 target_shape로 맞춤
+    // 예시) [3] shape(1,) → into_shape_with_order((1,)) → [3] shape(1,)
+    let result = result.into_shape_with_order(ndarray::IxDyn(target_shape)).unwrap();
+    Variable::new(result)
+}
+
 struct AddFn;
 
 impl Function for AddFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] + &xs[1]]
     }
-    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
-        vec![gys[0].clone(), gys[0].clone()]
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        // 첫 번째 입력 복구 index 0
+        let gx0 = sum_to(&gys[0], &xs[0].shape());
+        // 두 번째 입력 복구 index 1
+        let gx1 = sum_to(&gys[0], &xs[1].shape());
+        vec![gx0, gx1]
     }
     fn name(&self) -> &str { "Add" }
 }
@@ -447,8 +491,10 @@ impl Function for SubFn {
     fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
         vec![&xs[0] - &xs[1]]
     }
-    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
-        vec![gys[0].clone(), neg(&gys[0])]
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gx0 = sum_to(&gys[0], &xs[0].shape());
+        let gx1 = sum_to(&neg(&gys[0]), &xs[1].shape());
+        vec![gx0, gx1]
     }
     fn name(&self) -> &str { "Sub" }
 }
@@ -460,7 +506,9 @@ impl Function for MulFn {
         vec![&xs[0] * &xs[1]]
     }
     fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
-        vec![&xs[1] * &gys[0], &xs[0] * &gys[0]]
+        let gx0 = sum_to(&(&xs[1] * &gys[0]), &xs[0].shape());
+        let gx1 = sum_to(&(&xs[0] * &gys[0]), &xs[1].shape());
+        vec![gx0, gx1]
     }
     fn name(&self) -> &str { "Mul" }
 }
@@ -472,8 +520,8 @@ impl Function for DivFn {
         vec![&xs[0] / &xs[1]]
     }
     fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
-        let gx0 = &gys[0] / &xs[1];
-        let gx1 = &(&neg(&gys[0]) * &xs[0]) / &(&xs[1] * &xs[1]);
+        let gx0 = sum_to(&(&gys[0] / &xs[1]), &xs[0].shape());
+        let gx1 = sum_to(&(&(&neg(&gys[0]) * &xs[0]) / &(&xs[1] * &xs[1])), &xs[1].shape());
         vec![gx0, gx1]
     }
     fn name(&self) -> &str { "Div" }
