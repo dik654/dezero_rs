@@ -902,6 +902,42 @@ impl Linear {
     }
 }
 
+/// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
+/// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
+/// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
+///
+/// 사용법: 사용자가 자신의 모델 구조체를 만들고 Model 트레잇을 구현
+///   struct MyModel { l1: Linear, l2: Linear }
+///   impl Model for MyModel {
+///       fn forward(&self, x: &Variable) -> Variable { ... }
+///       fn layers(&self) -> Vec<&Linear> { vec![&self.l1, &self.l2] }
+///   }
+pub trait Model {
+    /// 순전파 (모델의 네트워크 구조를 정의)
+    fn forward(&self, x: &Variable) -> Variable;
+
+    /// 모델이 포함하는 모든 레이어를 반환
+    /// Python에서는 __setattr__로 자동 등록하지만
+    /// Rust에서는 사용자가 명시적으로 나열
+    fn layers(&self) -> Vec<&Linear>;
+
+    /// 모든 레이어의 모든 파라미터 기울기를 초기화
+    /// step44: l1.cleargrads(); l2.cleargrads();
+    /// step45: model.cleargrads();  ← 한 번으로 끝
+    fn cleargrads(&self) {
+        for l in self.layers() {
+            l.cleargrads();
+        }
+    }
+
+    /// 모든 레이어의 모든 파라미터를 반환
+    /// step44: for l in [&l1, &l2] { for p in l.params() { ... } }
+    /// step45: for p in model.params() { ... }  ← 모델 단위로 순회
+    fn params(&self) -> Vec<Variable> {
+        self.layers().iter().flat_map(|l| l.params()).collect()
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
