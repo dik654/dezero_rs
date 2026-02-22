@@ -1165,13 +1165,58 @@ impl<'a> SGD<'a> {
 
 // --- 데이터셋 ---
 
-/// Spiral 데이터셋 생성 (3클래스 나선형 분류 문제)
-/// Python의 dezero.datasets.get_spiral에 해당
+/// Dataset 트레잇: 데이터셋의 공통 인터페이스
+/// Python의 dezero.datasets.Dataset 클래스에 해당
 ///
-/// 3개 클래스가 각각 나선 팔(spiral arm)을 형성하는 2D 데이터를 생성.
-/// 각 클래스 100개씩 총 300개 샘플.
+/// 왜 필요한가?
+///   step48: get_spiral()이 (ArrayD, Vec<usize>) 튜플을 직접 반환
+///           → 데이터셋마다 반환 형태가 다를 수 있고, 배치 추출 로직이 사용자 측에 노출
+///   step49: Dataset 트레잇으로 통일된 인터페이스 제공
+///           → len()과 get()만 있으면 어떤 데이터셋이든 동일한 학습 루프 사용 가능
+pub trait Dataset {
+    /// 데이터셋의 총 샘플 수
+    fn len(&self) -> usize;
+
+    /// i번째 샘플을 (입력 벡터, 라벨) 쌍으로 반환
+    /// Python의 dataset[i]에 해당 (__getitem__)
+    fn get(&self, index: usize) -> (Vec<f64>, usize);
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Spiral 데이터셋 (3클래스 나선형 분류 문제)
+/// Python의 dezero.datasets.Spiral 클래스에 해당
 ///
-/// 반환: (x: (300, 2) 입력 좌표, t: 300개 클래스 라벨 [0, 1, 2])
+/// step48의 get_spiral()과 동일한 데이터를 생성하되,
+/// Dataset 트레잇을 구현하여 개별 샘플 접근(get)과 크기 조회(len)를 지원
+pub struct Spiral {
+    data: ArrayD<f64>,   // (N, 2) 입력 좌표
+    label: Vec<usize>,   // N개 클래스 라벨
+}
+
+impl Spiral {
+    pub fn new(train: bool) -> Self {
+        let (data, label) = get_spiral(train);
+        Spiral { data, label }
+    }
+}
+
+impl Dataset for Spiral {
+    fn len(&self) -> usize {
+        self.data.shape()[0]
+    }
+
+    fn get(&self, index: usize) -> (Vec<f64>, usize) {
+        let cols = self.data.shape()[1];
+        let x: Vec<f64> = (0..cols).map(|j| self.data[[index, j]]).collect();
+        (x, self.label[index])
+    }
+}
+
+/// Spiral 데이터셋의 원시 데이터 생성 (내부용)
+/// 3개 클래스 × 100개 = 300개 샘플, 각 2D 좌표
 pub fn get_spiral(train: bool) -> (ArrayD<f64>, Vec<usize>) {
     let seed: u64 = if train { 1984 } else { 2020 };
     let mut state: u64 = seed;
