@@ -711,6 +711,22 @@ impl Function for MatMulFn {
     fn name(&self) -> &str { "MatMul" }
 }
 
+struct SigmoidFn;
+
+impl Function for SigmoidFn {
+    // sigmoid: σ(x) = 1 / (1 + exp(-x))
+    // 순전파: 각 원소에 시그모이드 함수 적용 → 출력이 (0, 1) 범위
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(|x| 1.0 / (1.0 + (-x).exp()))]
+    }
+    // 역전파: σ'(x) = σ(x) * (1 - σ(x))
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let y = sigmoid(&xs[0]);
+        vec![&gys[0] * &(&y * &(1.0 - &y))]
+    }
+    fn name(&self) -> &str { "Sigmoid" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -773,6 +789,27 @@ pub fn transpose(x: &Variable) -> Variable {
 
 pub fn matmul(x: &Variable, w: &Variable) -> Variable {
     Func::new(MatMulFn).call(&[x, w])
+}
+
+pub fn sigmoid(x: &Variable) -> Variable {
+    Func::new(SigmoidFn).call(&[x])
+}
+
+/// 선형 변환: y = x @ W + b
+/// matmul과 add의 조합이므로 역전파는 자동으로 처리됨
+pub fn linear(x: &Variable, w: &Variable, b: Option<&Variable>) -> Variable {
+    let t = matmul(x, w);
+    match b {
+        Some(b) => &t + b,
+        None => t,
+    }
+}
+
+/// 평균제곱오차: sum((x0 - x1)²) / n
+pub fn mean_squared_error(x0: &Variable, x1: &Variable) -> Variable {
+    let diff = x0 - x1;
+    let n = diff.len();
+    &sum(&diff.pow(2.0)) / (n as f64)
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
