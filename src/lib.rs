@@ -938,6 +938,96 @@ pub trait Model {
     }
 }
 
+/// MLP (Multi-Layer Perceptron): 범용 다층 신경망
+/// step45의 TwoLayerNet은 2층 고정이었지만,
+/// MLP는 임의의 층 수를 지원: MLP::new(&[10, 5, 1]) → 3층
+/// 마지막 층을 제외한 모든 층에 활성화 함수(기본: sigmoid) 적용
+///
+/// 예시) MLP::new(&[10, 1]):
+///   x → Linear(10) → sigmoid → Linear(1) → 출력
+///
+/// 예시) MLP::new(&[20, 10, 1]):
+///   x → Linear(20) → sigmoid → Linear(10) → sigmoid → Linear(1) → 출력
+pub struct MLP {
+    layers: Vec<Linear>,
+    activation: fn(&Variable) -> Variable,
+}
+
+impl MLP {
+    /// sizes: 각 층의 출력 크기
+    /// 예) &[10, 1] → Linear(?→10) → sigmoid → Linear(10→1)
+    pub fn new(sizes: &[usize]) -> Self {
+        let layers = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Linear::new(size, 42 + i as u64))
+            .collect();
+        MLP {
+            layers,
+            activation: sigmoid,
+        }
+    }
+}
+
+impl Model for MLP {
+    fn forward(&self, x: &Variable) -> Variable {
+        let last = self.layers.len() - 1;
+        let mut h = x.clone(); // Rc clone (데이터 복사 아님)
+        for (i, l) in self.layers.iter().enumerate() {
+            h = l.forward(&h);
+            // 마지막 층에는 활성화 함수를 적용하지 않음
+            // 회귀: 출력 범위 제한 없이 실수값 출력
+            // 분류: 별도의 softmax 등을 적용하기 위해
+            if i < last {
+                h = (self.activation)(&h);
+            }
+        }
+        h
+    }
+
+    fn layers(&self) -> Vec<&Linear> {
+        self.layers.iter().collect()
+    }
+}
+
+// --- 옵티마이저 ---
+
+/// SGD (Stochastic Gradient Descent) 옵티마이저
+/// step45까지는 파라미터 업데이트를 직접 작성:
+///   for p in model.params() {
+///       p.set_data(&p.data() - &grad.mapv(|v| v * lr));
+///   }
+/// SGD 옵티마이저가 이 로직을 캡슐화:
+///   optimizer.update();  ← 한 줄로 끝
+///
+/// 업데이트 규칙: p ← p - lr × ∂L/∂p
+pub struct SGD<'a> {
+    lr: f64,
+    target: Option<&'a dyn Model>,
+}
+
+impl<'a> SGD<'a> {
+    pub fn new(lr: f64) -> Self {
+        SGD { lr, target: None }
+    }
+
+    /// 모델과 연결. Python의 optimizer.setup(model)에 해당.
+    /// 체이닝 가능: SGD::new(lr).setup(&model)
+    pub fn setup(mut self, model: &'a dyn Model) -> Self {
+        self.target = Some(model);
+        self
+    }
+
+    /// 모든 파라미터를 SGD 규칙으로 업데이트
+    pub fn update(&self) {
+        let model = self.target.expect("call setup() before update()");
+        for p in model.params() {
+            let grad = p.grad().unwrap();
+            p.set_data(&p.data() - &grad.mapv(|v| v * self.lr));
+        }
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
