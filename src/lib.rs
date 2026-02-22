@@ -930,6 +930,33 @@ pub fn softmax_cross_entropy_simple(x: &Variable, t: &[usize]) -> Variable {
     Func::new(SoftmaxCrossEntropyFn { t: t.to_vec() }).call(&[x])
 }
 
+/// 분류 정확도: 예측 클래스와 정답 클래스가 일치하는 비율
+/// y: 모델 출력 (N, C) logits, t: 정답 클래스 인덱스
+/// 각 행에서 argmax를 구해 정답과 비교
+/// 평가 지표이므로 backward 불필요 → f64 반환 (Variable이 아님)
+pub fn accuracy(y: &Variable, t: &[usize]) -> f64 {
+    let y_data = y.data();
+    let n = y_data.shape()[0];
+    let c = y_data.shape()[1];
+
+    let mut correct = 0;
+    for i in 0..n {
+        // argmax: 가장 큰 값의 인덱스 = 예측 클래스
+        let mut max_j = 0;
+        let mut max_val = f64::NEG_INFINITY;
+        for j in 0..c {
+            if y_data[[i, j]] > max_val {
+                max_val = y_data[[i, j]];
+                max_j = j;
+            }
+        }
+        if max_j == t[i] {
+            correct += 1;
+        }
+    }
+    correct as f64 / n as f64
+}
+
 /// 선형 변환: y = x @ W + b
 /// matmul과 add의 조합이므로 역전파는 자동으로 처리됨
 pub fn linear(x: &Variable, w: &Variable, b: Option<&Variable>) -> Variable {
@@ -1256,6 +1283,102 @@ pub fn get_spiral(train: bool) -> (ArrayD<f64>, Vec<usize>) {
 
     let x = ArrayD::from_shape_vec(ndarray::IxDyn(&[data_size, 2]), x).unwrap();
     (x, t)
+}
+
+// --- DataLoader ---
+
+/// DataLoader: Dataset을 배치 단위로 순회하는 이터레이터
+/// Python의 dezero.DataLoader에 해당
+///
+/// step49까지는 셔플, 인덱스 슬라이싱, 배치 조립을 수동으로 처리했다.
+/// DataLoader가 이 모든 것을 캡슐화:
+///   for (x, t) in &mut loader { ... }
+///
+/// shuffle=true면 매 reset()마다 인덱스를 무작위로 섞음.
+pub struct DataLoader<'a> {
+    dataset: &'a dyn Dataset,
+    batch_size: usize,
+    shuffle: bool,
+    rng_state: u64,
+    // 이터레이션 상태
+    indices: Vec<usize>,
+    current: usize,
+}
+
+impl<'a> DataLoader<'a> {
+    pub fn new(dataset: &'a dyn Dataset, batch_size: usize, shuffle: bool) -> Self {
+        let mut loader = DataLoader {
+            dataset,
+            batch_size,
+            shuffle,
+            rng_state: 0,
+            indices: (0..dataset.len()).collect(),
+            current: 0,
+        };
+        if shuffle {
+            loader.shuffle_indices();
+        }
+        loader
+    }
+
+    /// 이터레이터를 처음으로 되돌림 (다음 에폭 시작)
+    /// shuffle=true면 인덱스를 다시 섞음
+    pub fn reset(&mut self) {
+        self.current = 0;
+        if self.shuffle {
+            self.shuffle_indices();
+        }
+    }
+
+    /// Fisher-Yates 셔플 (LCG 난수 사용)
+    fn shuffle_indices(&mut self) {
+        let n = self.indices.len();
+        for i in (1..n).rev() {
+            self.rng_state = self
+                .rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = ((self.rng_state >> 11) as f64 / (1u64 << 53) as f64 * (i + 1) as f64)
+                as usize;
+            self.indices.swap(i, j);
+        }
+    }
+}
+
+impl<'a> Iterator for DataLoader<'a> {
+    type Item = (Variable, Vec<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let data_size = self.dataset.len();
+        if self.current >= data_size {
+            return None;
+        }
+
+        let start = self.current;
+        let end = (start + self.batch_size).min(data_size);
+        self.current = end;
+
+        let batch_indices = &self.indices[start..end];
+        let batch_len = end - start;
+
+        // Dataset.get()으로 개별 샘플을 꺼내서 배치 조립
+        let mut x_data = Vec::new();
+        let mut t_data = Vec::with_capacity(batch_len);
+        let mut input_dim = 0;
+
+        for &idx in batch_indices {
+            let (x, t) = self.dataset.get(idx);
+            input_dim = x.len();
+            x_data.extend_from_slice(&x);
+            t_data.push(t);
+        }
+
+        let x = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[batch_len, input_dim]), x_data).unwrap(),
+        );
+
+        Some((x, t_data))
+    }
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
