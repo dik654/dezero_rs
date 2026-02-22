@@ -812,6 +812,96 @@ pub fn mean_squared_error(x0: &Variable, x1: &Variable) -> Variable {
     &sum(&diff.pow(2.0)) / (n as f64)
 }
 
+// --- 레이어 ---
+
+/// Linear 레이어: y = x @ W + b
+/// step43까지는 W1, b1, W2, b2를 개별 Variable로 관리했지만,
+/// Linear 레이어로 묶으면:
+///   - cleargrads() 한 번으로 W, b 기울기 모두 초기화
+///   - params()로 모든 파라미터를 순회하며 업데이트
+///   - W의 초기화를 레이어가 자동으로 처리 (lazy initialization)
+pub struct Linear {
+    out_size: usize,
+    // 첫 forward 호출 전까지 None (lazy initialization)
+    // 입력 데이터가 와야 in_size를 알 수 있기 때문
+    w: RefCell<Option<Variable>>,
+    b: Variable,
+    // W 초기화용 난수 생성기 상태
+    rng_state: Cell<u64>,
+}
+
+impl Linear {
+    /// out_size만 지정하면 되고, in_size는 첫 forward 호출 시 자동 결정
+    /// seed: W 초기화에 사용할 난수 시드 (재현 가능한 실험을 위해)
+    pub fn new(out_size: usize, seed: u64) -> Self {
+        Linear {
+            out_size,
+            w: RefCell::new(None),
+            b: Variable::new(ArrayD::zeros(ndarray::IxDyn(&[out_size]))),
+            rng_state: Cell::new(seed),
+        }
+    }
+
+    // LCG 기반 균등분포 [0, 1) 난수 생성
+    fn next_f64(&self) -> f64 {
+        let state = self.rng_state.get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state.set(state);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    // Box-Muller 변환으로 표준정규분포 난수 생성
+    fn next_normal(&self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// 순전파: y = x @ W + b
+    /// 첫 호출 시 x의 shape에서 in_size를 결정하고 W를 Xavier 초기화
+    /// Xavier 초기화: randn(in, out) * sqrt(1/in)
+    ///   입력 뉴런 수에 맞춰 분산을 조절하여 신호가 너무 커지거나 사라지는 것을 방지
+    pub fn forward(&self, x: &Variable) -> Variable {
+        if self.w.borrow().is_none() {
+            let in_size = x.shape()[1];
+            let scale = (1.0 / in_size as f64).sqrt();
+            let w_data: Vec<f64> = (0..in_size * self.out_size)
+                .map(|_| self.next_normal() * scale)
+                .collect();
+            *self.w.borrow_mut() = Some(Variable::new(
+                ArrayD::from_shape_vec(
+                    ndarray::IxDyn(&[in_size, self.out_size]),
+                    w_data,
+                )
+                .unwrap(),
+            ));
+        }
+        linear(x, self.w.borrow().as_ref().unwrap(), Some(&self.b))
+    }
+
+    /// 모든 파라미터(W, b)의 기울기를 초기화
+    /// step43: w1.cleargrad(); b1.cleargrad(); w2.cleargrad(); b2.cleargrad();
+    /// step44: l1.cleargrads(); l2.cleargrads();  ← 레이어 단위로 간결해짐
+    pub fn cleargrads(&self) {
+        if let Some(w) = self.w.borrow().as_ref() {
+            w.cleargrad();
+        }
+        self.b.cleargrad();
+    }
+
+    /// 모든 파라미터를 반환 (경사하강법에서 순회하며 업데이트할 때 사용)
+    /// Variable의 Rc를 공유하므로 반환된 Variable을 수정하면 레이어 내부도 반영됨
+    pub fn params(&self) -> Vec<Variable> {
+        let mut params = Vec::new();
+        if let Some(w) = self.w.borrow().as_ref() {
+            params.push(w.clone());
+        }
+        params.push(self.b.clone());
+        params
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
