@@ -727,6 +727,117 @@ impl Function for SigmoidFn {
     fn name(&self) -> &str { "Sigmoid" }
 }
 
+struct ExpFn;
+
+impl Function for ExpFn {
+    // exp: y = e^x
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(f64::exp)]
+    }
+    // 역전파: exp'(x) = exp(x)  (미분해도 자기 자신)
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![&gys[0] * &exp(&xs[0])]
+    }
+    fn name(&self) -> &str { "Exp" }
+}
+
+struct LogFn;
+
+impl Function for LogFn {
+    // log: y = ln(x)
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(f64::ln)]
+    }
+    // 역전파: log'(x) = 1/x
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![&gys[0] / &xs[0]]
+    }
+    fn name(&self) -> &str { "Log" }
+}
+
+/// Softmax Cross-Entropy: 분류 문제의 손실 함수
+/// softmax로 확률 변환 후 정답 클래스의 -log(확률)의 평균
+/// softmax와 cross-entropy를 하나로 합쳐서 수치적으로 안정
+struct SoftmaxCrossEntropyFn {
+    t: Vec<usize>, // 정답 클래스 인덱스 (각 샘플마다 하나)
+}
+
+impl Function for SoftmaxCrossEntropyFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0]; // (N, C)
+        let n = x.shape()[0];
+        let c = x.shape()[1];
+
+        // 수치 안정성: 각 행에서 최댓값을 빼서 exp overflow 방지
+        // exp(100)은 overflow지만 exp(100-100) = exp(0) = 1
+        let mut softmax = ArrayD::zeros(x.raw_dim());
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..c {
+                max_val = max_val.max(x[[i, j]]);
+            }
+            let mut sum_exp = 0.0;
+            for j in 0..c {
+                let e = (x[[i, j]] - max_val).exp();
+                softmax[[i, j]] = e;
+                sum_exp += e;
+            }
+            for j in 0..c {
+                softmax[[i, j]] /= sum_exp;
+            }
+        }
+
+        // cross-entropy: -mean(log(p[i, t[i]]))
+        let mut loss = 0.0;
+        for i in 0..n {
+            let p = softmax[[i, self.t[i]]].max(1e-15); // log(0) 방지
+            loss -= p.ln();
+        }
+        loss /= n as f64;
+
+        vec![ndarray::arr0(loss).into_dyn()]
+    }
+
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let x_data = xs[0].data(); // (N, C)
+        let n = x_data.shape()[0];
+        let c = x_data.shape()[1];
+
+        // softmax 재계산 (수치 안정 버전)
+        let mut softmax = ArrayD::zeros(x_data.raw_dim());
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..c {
+                max_val = max_val.max(x_data[[i, j]]);
+            }
+            let mut sum_exp = 0.0;
+            for j in 0..c {
+                let e = (x_data[[i, j]] - max_val).exp();
+                softmax[[i, j]] = e;
+                sum_exp += e;
+            }
+            for j in 0..c {
+                softmax[[i, j]] /= sum_exp;
+            }
+        }
+
+        // gradient: (softmax - one_hot) / N
+        // 정답 클래스 위치에서만 1을 빼는 것이 one_hot 역할
+        for i in 0..n {
+            softmax[[i, self.t[i]]] -= 1.0;
+        }
+        let gx = softmax.mapv(|v| v / n as f64);
+
+        // upstream gradient 곱하기 (scalar)
+        let gy_val = gys[0].data().iter().next().copied().unwrap_or(1.0);
+        let gx = gx.mapv(|v| v * gy_val);
+
+        vec![Variable::new(gx)]
+    }
+
+    fn name(&self) -> &str { "SoftmaxCrossEntropy" }
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -793,6 +904,30 @@ pub fn matmul(x: &Variable, w: &Variable) -> Variable {
 
 pub fn sigmoid(x: &Variable) -> Variable {
     Func::new(SigmoidFn).call(&[x])
+}
+
+pub fn exp(x: &Variable) -> Variable {
+    Func::new(ExpFn).call(&[x])
+}
+
+pub fn log(x: &Variable) -> Variable {
+    Func::new(LogFn).call(&[x])
+}
+
+/// Softmax: 원시 점수를 확률로 변환 (각 행의 합 = 1)
+/// axis=1 방향으로 정규화: exp(x) / sum(exp(x), axis=1)
+/// 기존 연산(exp, sum_with, div)의 조합이므로 역전파는 자동 처리
+pub fn softmax_simple(x: &Variable) -> Variable {
+    let e = exp(x);
+    let s = sum_with(&e, Some(1), true); // axis=1, keepdims=true → (N, 1)
+    &e / &s // broadcast: (N, C) / (N, 1) → (N, C)
+}
+
+/// Softmax Cross-Entropy: 분류 문제의 표준 손실 함수
+/// x: 모델의 원시 출력 (N, C), t: 정답 클래스 인덱스 [0, C)
+/// 내부에서 softmax + cross-entropy를 한 번에 계산 (수치 안정)
+pub fn softmax_cross_entropy_simple(x: &Variable, t: &[usize]) -> Variable {
+    Func::new(SoftmaxCrossEntropyFn { t: t.to_vec() }).call(&[x])
 }
 
 /// 선형 변환: y = x @ W + b
@@ -1026,6 +1161,56 @@ impl<'a> SGD<'a> {
             p.set_data(&p.data() - &grad.mapv(|v| v * self.lr));
         }
     }
+}
+
+// --- 데이터셋 ---
+
+/// Spiral 데이터셋 생성 (3클래스 나선형 분류 문제)
+/// Python의 dezero.datasets.get_spiral에 해당
+///
+/// 3개 클래스가 각각 나선 팔(spiral arm)을 형성하는 2D 데이터를 생성.
+/// 각 클래스 100개씩 총 300개 샘플.
+///
+/// 반환: (x: (300, 2) 입력 좌표, t: 300개 클래스 라벨 [0, 1, 2])
+pub fn get_spiral(train: bool) -> (ArrayD<f64>, Vec<usize>) {
+    let seed: u64 = if train { 1984 } else { 2020 };
+    let mut state: u64 = seed;
+
+    let num_data = 100usize;
+    let num_class = 3usize;
+    let data_size = num_class * num_data;
+
+    let mut x = vec![0.0f64; data_size * 2];
+    let mut t = vec![0usize; data_size];
+
+    for j in 0..num_class {
+        for i in 0..num_data {
+            let rate = i as f64 / num_data as f64;
+            let radius = 1.0 * rate;
+
+            // Box-Muller: 균일분포 → 정규분포 (노이즈 생성용)
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u1 = ((state >> 11) as f64 / (1u64 << 53) as f64).max(1e-15);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u2 = (state >> 11) as f64 / (1u64 << 53) as f64;
+            let noise =
+                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+
+            // 각 클래스의 나선 각도 = 기본 오프셋 + 진행 + 노이즈
+            let theta = j as f64 * 4.0 + 4.0 * rate + noise * 0.2;
+            let ix = num_data * j + i;
+            x[ix * 2] = radius * theta.sin();
+            x[ix * 2 + 1] = radius * theta.cos();
+            t[ix] = j;
+        }
+    }
+
+    let x = ArrayD::from_shape_vec(ndarray::IxDyn(&[data_size, 2]), x).unwrap();
+    (x, t)
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
