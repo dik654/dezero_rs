@@ -11,6 +11,7 @@ use std::rc::{Rc, Weak};
 
 thread_local! {
     static ENABLE_BACKPROP: Cell<bool> = const { Cell::new(true) };
+    static TRAINING: Cell<bool> = const { Cell::new(true) };
 }
 
 // --- no_grad 모드 ---
@@ -39,6 +40,28 @@ fn using_backprop(enable: bool) -> NoGradGuard {
     let prev = ENABLE_BACKPROP.with(|c| c.get());
     ENABLE_BACKPROP.with(|c| c.set(enable));
     NoGradGuard { prev }
+}
+
+// --- test_mode (훈련/추론 모드 전환) ---
+
+pub struct TestModeGuard {
+    prev: bool,
+}
+
+/// 추론(테스트) 모드로 전환하는 RAII 가드
+/// Python의 with test_mode():에 해당
+/// 훈련 시 동작이 달라지는 연산(dropout 등)을 제어
+/// let _guard = test_mode(); 형태로 사용, 스코프 종료 시 자동 복원
+pub fn test_mode() -> TestModeGuard {
+    let prev = TRAINING.with(|c| c.get());
+    TRAINING.with(|c| c.set(false));
+    TestModeGuard { prev }
+}
+
+impl Drop for TestModeGuard {
+    fn drop(&mut self) {
+        TRAINING.with(|c| c.set(self.prev));
+    }
 }
 
 // --- 핵심 구조체 ---
@@ -839,6 +862,49 @@ impl Function for SoftmaxCrossEntropyFn {
     fn name(&self) -> &str { "SoftmaxCrossEntropy" }
 }
 
+/// Dropout: 훈련 시 뉴런을 무작위로 비활성화하는 정규화 기법
+/// Inverted Dropout 방식:
+///   훈련: y = x * mask / (1 - p)  (mask: 확률 p로 0, 아니면 1)
+///   추론: y = x  (그대로 통과)
+/// mask를 RefCell에 저장하여 backward에서 재사용
+struct DropoutFn {
+    dropout_ratio: f64,
+    mask: RefCell<ArrayD<f64>>,
+}
+
+impl Function for DropoutFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0];
+        // mask 생성: 각 원소가 dropout_ratio보다 크면 1, 아니면 0
+        let scale = 1.0 / (1.0 - self.dropout_ratio);
+        let mask = DROPOUT_RNG.with(|rng| {
+            let mut state = rng.get();
+            ArrayD::from_shape_fn(x.raw_dim(), |_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = (state >> 11) as f64 / (1u64 << 53) as f64;
+                rng.set(state);
+                if r > self.dropout_ratio { scale } else { 0.0 }
+            })
+        });
+        let y = x * &mask;
+        *self.mask.borrow_mut() = mask;
+        vec![y]
+    }
+
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let mask = self.mask.borrow();
+        vec![&gys[0] * &Variable::new(mask.clone())]
+    }
+
+    fn name(&self) -> &str { "Dropout" }
+}
+
+thread_local! {
+    static DROPOUT_RNG: Cell<u64> = const { Cell::new(1234567890) };
+}
+
 // --- 공개 함수 ---
 
 pub fn neg(x: &Variable) -> Variable {
@@ -905,6 +971,19 @@ pub fn matmul(x: &Variable, w: &Variable) -> Variable {
 
 pub fn sigmoid(x: &Variable) -> Variable {
     Func::new(SigmoidFn).call(&[x])
+}
+
+/// Dropout: 훈련 시 뉴런을 무작위 비활성화, 추론 시 통과
+/// dropout_ratio: 비활성화 확률 (기본 0.5)
+pub fn dropout(x: &Variable, dropout_ratio: f64) -> Variable {
+    if TRAINING.with(|c| c.get()) {
+        Func::new(DropoutFn {
+            dropout_ratio,
+            mask: RefCell::new(ArrayD::zeros(ndarray::IxDyn(&[]))),
+        }).call(&[x])
+    } else {
+        x.clone()
+    }
 }
 
 pub fn exp(x: &Variable) -> Variable {
