@@ -1037,6 +1037,12 @@ pub fn accuracy(y: &Variable, t: &[usize]) -> f64 {
     correct as f64 / n as f64
 }
 
+/// 합성곱 출력 크기 계산
+/// (input_size + 2*pad - kernel_size) / stride + 1
+pub fn get_conv_outsize(input_size: usize, kernel_size: usize, stride: usize, pad: usize) -> usize {
+    (input_size + pad * 2 - kernel_size) / stride + 1
+}
+
 /// 선형 변환: y = x @ W + b
 /// matmul과 add의 조합이므로 역전파는 자동으로 처리됨
 pub fn linear(x: &Variable, w: &Variable, b: Option<&Variable>) -> Variable {
