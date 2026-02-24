@@ -1099,6 +1099,93 @@ pub trait Model {
     fn params(&self) -> Vec<Variable> {
         self.layers().iter().flat_map(|l| l.params()).collect()
     }
+
+    /// 모든 파라미터를 바이너리 파일로 저장
+    /// Python의 model.save_weights('file.npz')에 해당
+    ///
+    /// 바이너리 포맷 (little-endian):
+    ///   파라미터 수 (u32)
+    ///   각 파라미터: ndim (u32) + shape (u32 × ndim) + data (f64 × 원소 수)
+    ///
+    /// params()의 순서가 결정적이므로 load_weights와 1:1 대응:
+    ///   layers[0].W, layers[0].b, layers[1].W, layers[1].b, ...
+    fn save_weights(&self, path: &str) {
+        use std::io::Write;
+        let params = self.params();
+        let mut file = std::fs::File::create(path).expect("failed to create weight file");
+
+        // 파라미터 개수
+        file.write_all(&(params.len() as u32).to_le_bytes()).unwrap();
+
+        for p in &params {
+            let data = p.data();
+            let shape = data.shape();
+
+            // ndim + shape
+            file.write_all(&(shape.len() as u32).to_le_bytes()).unwrap();
+            for &dim in shape {
+                file.write_all(&(dim as u32).to_le_bytes()).unwrap();
+            }
+
+            // f64 데이터 (raw bytes)
+            for &val in data.iter() {
+                file.write_all(&val.to_le_bytes()).unwrap();
+            }
+        }
+    }
+
+    /// 바이너리 파일에서 파라미터를 로드하여 모델에 복원
+    /// Python의 model.load_weights('file.npz')에 해당
+    ///
+    /// Rc<RefCell<>>로 공유되므로 set_data()가 레이어 원본도 갱신:
+    ///   params()[i].set_data(loaded_data)
+    ///   → layers[k].W 또는 layers[k].b의 내부 데이터가 교체됨
+    ///
+    /// 주의: lazy init 전(forward 미호출)에는 W가 None이라 params()에 포함 안 됨.
+    ///       저장 시점과 로드 시점의 파라미터 수가 일치해야 함.
+    fn load_weights(&self, path: &str) {
+        let bytes = std::fs::read(path).expect("failed to read weight file");
+        let mut offset = 0;
+
+        // 파라미터 개수 읽기
+        let num_params = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        let params = self.params();
+        assert_eq!(
+            params.len(),
+            num_params,
+            "parameter count mismatch: model has {}, file has {}",
+            params.len(),
+            num_params
+        );
+
+        for p in &params {
+            // ndim
+            let ndim = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            // shape
+            let mut shape = Vec::with_capacity(ndim);
+            for _ in 0..ndim {
+                let dim = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += 4;
+                shape.push(dim);
+            }
+
+            // f64 데이터
+            let num_elements: usize = shape.iter().product();
+            let mut data = Vec::with_capacity(num_elements);
+            for _ in 0..num_elements {
+                let val = f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                data.push(val);
+            }
+
+            let arr = ArrayD::from_shape_vec(ndarray::IxDyn(&shape), data).unwrap();
+            p.set_data(arr);
+        }
+    }
 }
 
 /// MLP (Multi-Layer Perceptron): 범용 다층 신경망
