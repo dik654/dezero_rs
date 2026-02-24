@@ -6,6 +6,7 @@ use ndarray::ArrayD;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
+use std::io::Read;
 use std::rc::{Rc, Weak};
 
 thread_local! {
@@ -1283,6 +1284,177 @@ pub fn get_spiral(train: bool) -> (ArrayD<f64>, Vec<usize>) {
 
     let x = ArrayD::from_shape_vec(ndarray::IxDyn(&[data_size, 2]), x).unwrap();
     (x, t)
+}
+
+/// MNIST 손글씨 숫자 데이터셋
+/// Python의 dezero.datasets.MNIST에 해당
+///
+/// MNIST (Modified National Institute of Standards and Technology):
+///   1998년 Yann LeCun이 공개한 머신러닝의 "Hello World" 벤치마크.
+///   손으로 쓴 숫자 0~9의 28×28 그레이스케일 이미지.
+///
+/// 데이터 흐름:
+///   1) 첫 사용 시 인터넷에서 .gz 파일 4개를 다운로드 → ~/.dezero/mnist/에 캐시
+///   2) flate2로 gzip 해제 → IDX 바이너리 형식 파싱
+///   3) 각 28×28 이미지를 784차원 벡터로 flatten
+///   4) 픽셀값 [0, 255] → [0, 1]로 정규화 (/255.0)
+///      (정규화 이유: 원시 픽셀값이 크면 sigmoid 포화 → 기울기 소실 → 학습 실패)
+///
+/// 크기: train 60,000개, test 10,000개, 라벨 0~9 (10클래스)
+pub struct MNIST {
+    data: Vec<Vec<f64>>,  // N개 샘플, 각 784차원 (28×28 flatten, [0,1] 정규화)
+    label: Vec<usize>,    // N개 라벨 (0~9 숫자)
+}
+
+impl MNIST {
+    /// MNIST 데이터셋을 로드한다.
+    /// train=true: 학습용 60,000개, train=false: 테스트용 10,000개
+    ///
+    /// 내부 흐름:
+    ///   1) 캐시 디렉토리(~/.dezero/mnist/) 생성
+    ///   2) 파일이 없으면 HTTP GET으로 다운로드 (ureq 사용)
+    ///   3) .gz 파일을 flate2로 해제 → IDX 바이너리 파싱
+    ///   4) 이미 캐시에 있으면 다운로드 스킵 → 즉시 파싱
+    pub fn new(train: bool) -> Self {
+        // PyTorch에서 사용하는 MNIST 미러 (원본 yann.lecun.com은 종종 불안정)
+        let base_url = "https://ossci-datasets.s3.amazonaws.com/mnist/";
+
+        // train/test에 따라 다른 파일 4개 중 2개를 선택
+        //   train: train-images-idx3-ubyte.gz (~9.9MB), train-labels-idx1-ubyte.gz (~29KB)
+        //   test:  t10k-images-idx3-ubyte.gz  (~1.6MB), t10k-labels-idx1-ubyte.gz  (~4.5KB)
+        let (img_file, lbl_file) = if train {
+            ("train-images-idx3-ubyte.gz", "train-labels-idx1-ubyte.gz")
+        } else {
+            ("t10k-images-idx3-ubyte.gz", "t10k-labels-idx1-ubyte.gz")
+        };
+
+        // 캐시 디렉토리: ~/.dezero/mnist/
+        // Python DeZero도 동일하게 ~/.dezero에 캐시
+        let cache_dir = dirs_cache_path();
+        std::fs::create_dir_all(&cache_dir).expect("failed to create cache dir");
+
+        let img_path = format!("{}/{}", cache_dir, img_file);
+        let lbl_path = format!("{}/{}", cache_dir, lbl_file);
+
+        // 다운로드: 캐시에 파일이 이미 있으면 스킵
+        download_if_missing(&format!("{}{}", base_url, img_file), &img_path);
+        download_if_missing(&format!("{}{}", base_url, lbl_file), &lbl_path);
+
+        // IDX 바이너리 파일 파싱 → 메모리에 로드
+        let data = load_mnist_images(&img_path);
+        let label = load_mnist_labels(&lbl_path);
+
+        MNIST { data, label }
+    }
+}
+
+impl Dataset for MNIST {
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn get(&self, index: usize) -> (Vec<f64>, usize) {
+        (self.data[index].clone(), self.label[index])
+    }
+}
+
+/// MNIST 캐시 디렉토리 경로를 반환 (~/.dezero/mnist/)
+/// Python DeZero와 동일한 캐시 위치를 사용
+fn dirs_cache_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{}/.dezero/mnist", home)
+}
+
+/// URL에서 파일 다운로드 (캐시에 없을 때만)
+/// 파일이 이미 존재하면 즉시 반환 (캐시 히트)
+/// ureq 크레이트로 동기 HTTP GET 요청 → 바이트 읽기 → 파일 저장
+fn download_if_missing(url: &str, path: &str) {
+    if std::path::Path::new(path).exists() {
+        return; // 캐시 히트: 이미 다운로드된 파일 있음
+    }
+    println!("Downloading {} ...", url);
+    let resp = ureq::get(url).call().expect("failed to download MNIST");
+    let mut bytes = Vec::new();
+    resp.into_body()
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .expect("failed to read response");
+    std::fs::write(path, &bytes).expect("failed to write cache file");
+    println!("Saved to {}", path);
+}
+
+/// gzip 압축된 IDX 이미지 파일을 파싱하여 Vec<Vec<f64>> 반환
+///
+/// IDX 파일 형식 (MNIST 자체 바이너리 포맷):
+///   오프셋 0~3:   매직 넘버 0x00000803 (2051) — big-endian u32
+///                 0x08 = unsigned byte, 0x03 = 3차원 (count × rows × cols)
+///   오프셋 4~7:   이미지 수 (60000 또는 10000)
+///   오프셋 8~11:  행 수 (28)
+///   오프셋 12~15: 열 수 (28)
+///   오프셋 16~:   픽셀 데이터 (각 이미지 784바이트, uint8)
+///
+/// 각 픽셀을 255.0으로 나누어 [0, 1] 범위로 정규화:
+///   0 (검정) → 0.0, 255 (흰색) → 1.0
+fn load_mnist_images(gz_path: &str) -> Vec<Vec<f64>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    // 1단계: gzip 해제 → 원본 바이너리를 메모리에 로드
+    let file = std::fs::File::open(gz_path).expect("failed to open image file");
+    let mut decoder = GzDecoder::new(file);
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf).expect("failed to decompress");
+
+    // 2단계: IDX 헤더 파싱 (모든 정수는 big-endian)
+    let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    assert_eq!(magic, 2051, "invalid image magic number");
+
+    let count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let rows = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+    let cols = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
+    let pixels = rows * cols; // 28 × 28 = 784
+
+    // 3단계: 이미지 데이터 추출 (헤더 16바이트 이후부터)
+    // 각 이미지: 연속된 784바이트 → uint8 → f64 / 255.0
+    let data_start = 16;
+    let mut images = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = data_start + i * pixels;
+        let img: Vec<f64> = buf[offset..offset + pixels]
+            .iter()
+            .map(|&b| b as f64 / 255.0) // [0, 255] → [0.0, 1.0]
+            .collect();
+        images.push(img);
+    }
+    images
+}
+
+/// gzip 압축된 IDX 라벨 파일을 파싱하여 Vec<usize> 반환
+///
+/// IDX 라벨 파일 형식:
+///   오프셋 0~3: 매직 넘버 0x00000801 (2049) — 0x01 = 1차원 (count만)
+///   오프셋 4~7: 라벨 수 (60000 또는 10000)
+///   오프셋 8~:  라벨 데이터 (각 1바이트, 값 0~9)
+fn load_mnist_labels(gz_path: &str) -> Vec<usize> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let file = std::fs::File::open(gz_path).expect("failed to open label file");
+    let mut decoder = GzDecoder::new(file);
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf).expect("failed to decompress");
+
+    // 매직 넘버 2049 = 0x0801: unsigned byte 데이터, 1차원
+    let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    assert_eq!(magic, 2049, "invalid label magic number");
+
+    let count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+
+    let data_start = 8;
+    buf[data_start..data_start + count]
+        .iter()
+        .map(|&b| b as usize)
+        .collect()
 }
 
 // --- DataLoader ---

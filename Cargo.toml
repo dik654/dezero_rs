@@ -171,5 +171,11 @@ path = "steps/step49.rs"
 name = "step50"
 path = "steps/step50.rs"
 
+[[test]]
+name = "step51"
+path = "steps/step51.rs"
+
 [dependencies]
 ndarray = "0.16"
+ureq = "3"
+flate2 = "1"
