@@ -1043,6 +1043,248 @@ pub fn get_conv_outsize(input_size: usize, kernel_size: usize, stride: usize, pa
     (input_size + pad * 2 - kernel_size) / stride + 1
 }
 
+// --- im2col / col2im ---
+
+/// im2col: 4D 이미지 텐서를 2D 행렬로 변환 (순수 데이터 연산)
+/// 입력 (N, C, H, W) → 출력 (N*OH*OW, C*KH*KW)
+/// 각 행 = 커널 크기의 패치 하나를 펼친 것
+fn im2col_data(
+    x: &ArrayD<f64>, kh: usize, kw: usize,
+    sh: usize, sw: usize, ph: usize, pw: usize,
+) -> ArrayD<f64> {
+    let shape = x.shape();
+    let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+    let oh = get_conv_outsize(h, kh, sh, ph);
+    let ow = get_conv_outsize(w, kw, sw, pw);
+
+    // 패딩 적용
+    let h_pad = h + 2 * ph;
+    let w_pad = w + 2 * pw;
+    let mut x_pad = ArrayD::zeros(ndarray::IxDyn(&[n, c, h_pad, w_pad]));
+    for ni in 0..n {
+        for ci in 0..c {
+            for hi in 0..h {
+                for wi in 0..w {
+                    x_pad[[ni, ci, hi + ph, wi + pw]] = x[[ni, ci, hi, wi]];
+                }
+            }
+        }
+    }
+
+    // im2col: 각 패치를 행으로 펼침
+    let rows = n * oh * ow;
+    let cols = c * kh * kw;
+    let mut col = vec![0.0; rows * cols];
+
+    for ni in 0..n {
+        for i in 0..oh {
+            for j in 0..ow {
+                let row = ni * oh * ow + i * ow + j;
+                let h_start = i * sh;
+                let w_start = j * sw;
+                for ci in 0..c {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let col_idx = ci * kh * kw + ki * kw + kj;
+                            col[row * cols + col_idx] =
+                                x_pad[[ni, ci, h_start + ki, w_start + kj]];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ArrayD::from_shape_vec(ndarray::IxDyn(&[rows, cols]), col).unwrap()
+}
+
+/// col2im: im2col의 역연산 (2D 행렬 → 4D 텐서)
+/// 입력 (N*OH*OW, C*KH*KW) → 출력 (N, C, H, W)
+/// 겹치는 위치는 합산 (scatter-add)
+fn col2im_data(
+    col: &ArrayD<f64>, x_shape: &[usize],
+    kh: usize, kw: usize, sh: usize, sw: usize, ph: usize, pw: usize,
+) -> ArrayD<f64> {
+    let (n, c, h, w) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+    let oh = get_conv_outsize(h, kh, sh, ph);
+    let ow = get_conv_outsize(w, kw, sw, pw);
+    let h_pad = h + 2 * ph;
+    let w_pad = w + 2 * pw;
+
+    let mut x_pad = ArrayD::zeros(ndarray::IxDyn(&[n, c, h_pad, w_pad]));
+
+    for ni in 0..n {
+        for i in 0..oh {
+            for j in 0..ow {
+                let row = ni * oh * ow + i * ow + j;
+                let h_start = i * sh;
+                let w_start = j * sw;
+                for ci in 0..c {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let col_idx = ci * kh * kw + ki * kw + kj;
+                            x_pad[[ni, ci, h_start + ki, w_start + kj]] +=
+                                col[[row, col_idx]];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 패딩 제거
+    if ph == 0 && pw == 0 {
+        x_pad
+    } else {
+        let mut result = ArrayD::zeros(ndarray::IxDyn(&[n, c, h, w]));
+        for ni in 0..n {
+            for ci in 0..c {
+                for hi in 0..h {
+                    for wi in 0..w {
+                        result[[ni, ci, hi, wi]] = x_pad[[ni, ci, hi + ph, wi + pw]];
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Im2col Function: 역전파를 지원하는 im2col
+struct Im2colFn {
+    kh: usize, kw: usize,
+    sh: usize, sw: usize,
+    ph: usize, pw: usize,
+    x_shape: Vec<usize>,
+}
+
+impl Function for Im2colFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![im2col_data(&xs[0], self.kh, self.kw, self.sh, self.sw, self.ph, self.pw)]
+    }
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gy_data = gys[0].data();
+        let gx = col2im_data(&gy_data, &self.x_shape, self.kh, self.kw, self.sh, self.sw, self.ph, self.pw);
+        vec![Variable::new(gx)]
+    }
+    fn name(&self) -> &str { "Im2col" }
+}
+
+/// Conv2d (simple): im2col + 행렬곱으로 합성곱 수행
+struct Conv2dSimpleFn {
+    kh: usize, kw: usize,
+    sh: usize, sw: usize,
+    ph: usize, pw: usize,
+    x_shape: Vec<usize>,
+    w_shape: Vec<usize>,
+    col: RefCell<ArrayD<f64>>, // forward에서 저장, backward에서 dw 계산에 사용
+}
+
+impl Function for Conv2dSimpleFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0]; // (N, C, H, W)
+        let w = &xs[1]; // (OC, C, KH, KW)
+
+        let n = self.x_shape[0];
+        let oc = self.w_shape[0];
+        let oh = get_conv_outsize(self.x_shape[2], self.kh, self.sh, self.ph);
+        let ow = get_conv_outsize(self.x_shape[3], self.kw, self.sw, self.pw);
+
+        // im2col: (N*OH*OW, C*KH*KW)
+        let col = im2col_data(x, self.kh, self.kw, self.sh, self.sw, self.ph, self.pw);
+
+        // W → (OC, C*KH*KW)
+        let ckk = self.w_shape[1] * self.kh * self.kw;
+        let w_2d = w.to_shape((oc, ckk)).unwrap();
+
+        // col @ W^T → (N*OH*OW, OC)
+        let col_2d = col.view().into_dimensionality::<ndarray::Ix2>().unwrap();
+        let y_2d = col_2d.dot(&w_2d.t()); // (N*OH*OW, OC)
+
+        // (N*OH*OW, OC) → (N, OH, OW, OC) → (N, OC, OH, OW)
+        let mut y = ArrayD::zeros(ndarray::IxDyn(&[n, oc, oh, ow]));
+        for ni in 0..n {
+            for oci in 0..oc {
+                for hi in 0..oh {
+                    for wi in 0..ow {
+                        y[[ni, oci, hi, wi]] = y_2d[[ni * oh * ow + hi * ow + wi, oci]];
+                    }
+                }
+            }
+        }
+
+        *self.col.borrow_mut() = col;
+        vec![y]
+    }
+
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gy = gys[0].data(); // (N, OC, OH, OW)
+        let n = self.x_shape[0];
+        let oc = self.w_shape[0];
+        let ckk = self.w_shape[1] * self.kh * self.kw;
+        let oh = get_conv_outsize(self.x_shape[2], self.kh, self.sh, self.ph);
+        let ow = get_conv_outsize(self.x_shape[3], self.kw, self.sw, self.pw);
+
+        // gy (N, OC, OH, OW) → gy_2d (N*OH*OW, OC)
+        let mut gy_2d = ndarray::Array2::zeros((n * oh * ow, oc));
+        for ni in 0..n {
+            for oci in 0..oc {
+                for hi in 0..oh {
+                    for wi in 0..ow {
+                        gy_2d[[ni * oh * ow + hi * ow + wi, oci]] = gy[[ni, oci, hi, wi]];
+                    }
+                }
+            }
+        }
+
+        let col = self.col.borrow();
+        let col_2d = col.view().into_dimensionality::<ndarray::Ix2>().unwrap();
+
+        // W: (OC, C*KH*KW)
+        let w_data = _xs[1].data();
+        let w_2d = w_data.to_shape((oc, ckk)).unwrap();
+
+        // dx: dcol = gy_2d @ W → (N*OH*OW, C*KH*KW) → col2im → (N,C,H,W)
+        let dcol = gy_2d.dot(&w_2d);
+        let dcol_dyn = dcol.into_dyn();
+        let gx = col2im_data(&dcol_dyn, &self.x_shape, self.kh, self.kw, self.sh, self.sw, self.ph, self.pw);
+
+        // dw: col^T @ gy_2d → (C*KH*KW, OC) → transpose → (OC, C*KH*KW) → reshape (OC,C,KH,KW)
+        let dw_2d = col_2d.t().dot(&gy_2d); // (C*KH*KW, OC)
+        let dw_t = dw_2d.t().to_owned(); // (OC, C*KH*KW)
+        let dw = ArrayD::from_shape_vec(ndarray::IxDyn(&self.w_shape), dw_t.into_raw_vec_and_offset().0).unwrap();
+
+        vec![Variable::new(gx), Variable::new(dw)]
+    }
+
+    fn name(&self) -> &str { "Conv2d" }
+}
+
+/// im2col: 4D 텐서를 2D 행렬로 변환 (역전파 지원)
+pub fn im2col(x: &Variable, kh: usize, kw: usize, sh: usize, sw: usize, ph: usize, pw: usize) -> Variable {
+    let x_shape = x.shape();
+    Func::new(Im2colFn { kh, kw, sh, sw, ph, pw, x_shape }).call(&[x])
+}
+
+/// conv2d_simple: im2col + matmul 기반 2D 합성곱
+pub fn conv2d_simple(x: &Variable, w: &Variable, b: Option<&Variable>, stride: usize, pad: usize) -> Variable {
+    let x_shape = x.shape();
+    let w_shape = w.shape();
+    let kh = w_shape[2];
+    let kw = w_shape[3];
+
+    let y = Func::new(Conv2dSimpleFn {
+        kh, kw, sh: stride, sw: stride, ph: pad, pw: pad,
+        x_shape, w_shape,
+        col: RefCell::new(ArrayD::zeros(ndarray::IxDyn(&[]))),
+    }).call(&[x, w]);
+
+    match b {
+        Some(b) => &y + b,
+        None => y,
+    }
+}
+
 /// 선형 변환: y = x @ W + b
 /// matmul과 add의 조합이므로 역전파는 자동으로 처리됨
 pub fn linear(x: &Variable, w: &Variable, b: Option<&Variable>) -> Variable {
