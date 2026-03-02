@@ -1509,6 +1509,167 @@ impl RNN {
     }
 }
 
+/// LSTM (Long Short-Term Memory) 레이어
+///
+/// RNN의 한계: 시퀀스가 길면 기울기 소실/폭발 (vanishing/exploding gradient)
+/// LSTM은 셀 상태(cell state)와 게이트 메커니즘으로 이 문제를 해결
+///
+/// 4개의 게이트:
+///   f = σ(x @ W_xf + h @ W_hf + b_f)   — forget: 이전 기억을 얼마나 잊을지
+///   i = σ(x @ W_xi + h @ W_hi + b_i)   — input: 새 정보를 얼마나 기억할지
+///   g = tanh(x @ W_xg + h @ W_hg + b_g) — candidate: 새로운 후보 기억
+///   o = σ(x @ W_xo + h @ W_ho + b_o)   — output: 무엇을 출력할지
+///
+/// 상태 업데이트:
+///   c_new = f ⊙ c + i ⊙ g              — 셀 상태: 선택적 기억/망각
+///   h_new = o ⊙ tanh(c_new)             — 은닉 상태: 셀을 필터링한 출력
+///
+/// c는 "장기 기억", h는 "단기 기억(출력)" 역할
+/// ⊙는 원소별 곱 (element-wise multiplication)
+pub struct LSTM {
+    // 입력 → 게이트 (bias 포함)
+    x2f: Linear,
+    x2i: Linear,
+    x2o: Linear,
+    x2g: Linear,
+    // 은닉 → 게이트 (bias 없음, lazy init)
+    w_hf: RefCell<Option<Variable>>,
+    w_hi: RefCell<Option<Variable>>,
+    w_ho: RefCell<Option<Variable>>,
+    w_hg: RefCell<Option<Variable>>,
+    // 상태
+    h: RefCell<Option<Variable>>,
+    c: RefCell<Option<Variable>>,
+    hidden_size: usize,
+    rng_state: Cell<u64>,
+}
+
+impl LSTM {
+    pub fn new(hidden_size: usize) -> Self {
+        LSTM {
+            x2f: Linear::new(hidden_size, 200),
+            x2i: Linear::new(hidden_size, 201),
+            x2o: Linear::new(hidden_size, 202),
+            x2g: Linear::new(hidden_size, 203),
+            w_hf: RefCell::new(None),
+            w_hi: RefCell::new(None),
+            w_ho: RefCell::new(None),
+            w_hg: RefCell::new(None),
+            h: RefCell::new(None),
+            c: RefCell::new(None),
+            hidden_size,
+            rng_state: Cell::new(300),
+        }
+    }
+
+    fn next_f64(&self) -> f64 {
+        let state = self.rng_state.get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state.set(state);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_normal(&self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Xavier 초기화된 (hidden_size, hidden_size) 가중치 생성
+    fn init_w_h(&self) -> Variable {
+        let scale = (1.0 / self.hidden_size as f64).sqrt();
+        let w_data: Vec<f64> = (0..self.hidden_size * self.hidden_size)
+            .map(|_| self.next_normal() * scale)
+            .collect();
+        Variable::new(
+            ArrayD::from_shape_vec(
+                ndarray::IxDyn(&[self.hidden_size, self.hidden_size]),
+                w_data,
+            ).unwrap(),
+        )
+    }
+
+    pub fn reset_state(&self) {
+        *self.h.borrow_mut() = None;
+        *self.c.borrow_mut() = None;
+    }
+
+    pub fn forward(&self, x: &Variable) -> Variable {
+        // h→gate 가중치 lazy init
+        if self.w_hf.borrow().is_none() {
+            *self.w_hf.borrow_mut() = Some(self.init_w_h());
+            *self.w_hi.borrow_mut() = Some(self.init_w_h());
+            *self.w_ho.borrow_mut() = Some(self.init_w_h());
+            *self.w_hg.borrow_mut() = Some(self.init_w_h());
+        }
+
+        // 4개 게이트 계산
+        let (f, i, o, g) = if self.h.borrow().is_none() {
+            // 첫 스텝: h가 없으므로 x→gate만 사용
+            (
+                sigmoid(&self.x2f.forward(x)),
+                sigmoid(&self.x2i.forward(x)),
+                sigmoid(&self.x2o.forward(x)),
+                tanh(&self.x2g.forward(x)),
+            )
+        } else {
+            let h = self.h.borrow().clone().unwrap();
+            let w_hf = self.w_hf.borrow().as_ref().unwrap().clone();
+            let w_hi = self.w_hi.borrow().as_ref().unwrap().clone();
+            let w_ho = self.w_ho.borrow().as_ref().unwrap().clone();
+            let w_hg = self.w_hg.borrow().as_ref().unwrap().clone();
+            (
+                sigmoid(&(&self.x2f.forward(x) + &matmul(&h, &w_hf))),
+                sigmoid(&(&self.x2i.forward(x) + &matmul(&h, &w_hi))),
+                sigmoid(&(&self.x2o.forward(x) + &matmul(&h, &w_ho))),
+                tanh(&(&self.x2g.forward(x) + &matmul(&h, &w_hg))),
+            )
+        };
+
+        // 셀 상태 업데이트: c_new = f ⊙ c + i ⊙ g
+        let c_new = if self.c.borrow().is_none() {
+            &i * &g // 첫 스텝: forget할 것이 없음
+        } else {
+            let c = self.c.borrow().clone().unwrap();
+            &(&f * &c) + &(&i * &g)
+        };
+
+        // 은닉 상태 업데이트: h_new = o ⊙ tanh(c_new)
+        let h_new = &o * &tanh(&c_new);
+
+        *self.h.borrow_mut() = Some(h_new.clone());
+        *self.c.borrow_mut() = Some(c_new);
+        h_new
+    }
+
+    pub fn cleargrads(&self) {
+        self.x2f.cleargrads();
+        self.x2i.cleargrads();
+        self.x2o.cleargrads();
+        self.x2g.cleargrads();
+        for w in [&self.w_hf, &self.w_hi, &self.w_ho, &self.w_hg] {
+            if let Some(w) = w.borrow().as_ref() {
+                w.cleargrad();
+            }
+        }
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut params = Vec::new();
+        params.extend(self.x2f.params());
+        params.extend(self.x2i.params());
+        params.extend(self.x2o.params());
+        params.extend(self.x2g.params());
+        for w in [&self.w_hf, &self.w_hi, &self.w_ho, &self.w_hg] {
+            if let Some(w) = w.borrow().as_ref() {
+                params.push(w.clone());
+            }
+        }
+        params
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
@@ -2107,6 +2268,72 @@ impl SinCurve {
     /// i번째 샘플: (입력값, 목표값)
     pub fn get(&self, i: usize) -> (f64, f64) {
         (self.x[i], self.t[i])
+    }
+}
+
+/// SeqDataLoader: 시계열 데이터를 배치 단위로 순차 로딩
+///
+/// 일반 DataLoader와의 차이:
+///   DataLoader: 랜덤 셔플 가능, 순서 무관 (분류 등)
+///   SeqDataLoader: 시간 순서를 유지하면서 배치 병렬화 (RNN/LSTM 학습용)
+///
+/// 원리: 시퀀스를 batch_size개의 병렬 스트림으로 분할
+///   데이터: [0, 1, 2, 3, 4, 5, 6, 7, 8], batch_size=3
+///   스트림 0: [0, 1, 2]   스트림 1: [3, 4, 5]   스트림 2: [6, 7, 8]
+///   t=0: batch = [0, 3, 6]
+///   t=1: batch = [1, 4, 7]
+///   t=2: batch = [2, 5, 8]
+pub struct SeqDataLoader<'a> {
+    dataset: &'a SinCurve,
+    batch_size: usize,
+    pub jump: usize,
+    current: usize,
+}
+
+impl<'a> SeqDataLoader<'a> {
+    pub fn new(dataset: &'a SinCurve, batch_size: usize) -> Self {
+        let jump = dataset.len() / batch_size;
+        SeqDataLoader {
+            dataset,
+            batch_size,
+            jump,
+            current: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.current = 0;
+    }
+}
+
+impl<'a> Iterator for SeqDataLoader<'a> {
+    type Item = (Variable, Variable);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.jump {
+            return None;
+        }
+
+        let mut x_data = Vec::with_capacity(self.batch_size);
+        let mut t_data = Vec::with_capacity(self.batch_size);
+
+        for j in 0..self.batch_size {
+            let idx = j * self.jump + self.current;
+            let (x, t) = self.dataset.get(idx);
+            x_data.push(x);
+            t_data.push(t);
+        }
+
+        self.current += 1;
+
+        let x = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[self.batch_size, 1]), x_data).unwrap(),
+        );
+        let t = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[self.batch_size, 1]), t_data).unwrap(),
+        );
+
+        Some((x, t))
     }
 }
 
