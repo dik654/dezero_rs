@@ -261,6 +261,28 @@ impl Variable {
             }
         }
     }
+
+    /// 계산 그래프를 절단하여 역전파 전파를 막음 (Truncated BPTT용)
+    ///
+    /// RNN 학습에서 시간 스텝이 길어지면 역전파 비용이 무한히 증가.
+    /// loss.backward() 후 loss.unchain_backward()를 호출하면:
+    ///   - 현재 loss에서 거슬러 올라가며 모든 중간 Variable의 creator를 제거
+    ///   - 다음 backward에서는 절단된 지점 이전으로 역전파되지 않음
+    ///   - 은닉 상태 h는 값은 유지되지만 그래프 연결이 끊김 → 상수 취급
+    pub fn unchain_backward(&self) {
+        if let Some(creator) = self.inner.borrow().creator.clone() {
+            let mut funcs = vec![creator];
+            while let Some(state_ref) = funcs.pop() {
+                let state = state_ref.borrow();
+                for input in &state.inputs {
+                    let mut inner = input.inner.borrow_mut();
+                    if let Some(c) = inner.creator.take() {
+                        funcs.push(c);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Display for Variable {
@@ -1392,6 +1414,101 @@ impl Linear {
     }
 }
 
+/// RNN (Recurrent Neural Network) 레이어
+///
+/// 순환 신경망의 핵심: 은닉 상태(hidden state)가 시간 스텝 간에 전달됨
+///   h_new = tanh(x @ W_x + b + h @ W_h)
+///
+/// 시간 전개:
+///   t=0: h₁ = tanh(x₀ @ W_x + b)           ← 초기 은닉 상태 없음
+///   t=1: h₂ = tanh(x₁ @ W_x + b + h₁ @ W_h) ← h₁이 전달됨
+///   t=2: h₃ = tanh(x₂ @ W_x + b + h₂ @ W_h) ← h₂가 전달됨
+///
+/// h는 Variable이므로 계산 그래프가 시간 스텝을 넘어 연결됨
+/// → backward하면 시간을 거슬러 기울기가 전파됨 (BPTT)
+/// → unchain_backward()로 절단하면 Truncated BPTT
+pub struct RNN {
+    x2h: Linear,
+    w_h: RefCell<Option<Variable>>,
+    h: RefCell<Option<Variable>>,
+    hidden_size: usize,
+    rng_state: Cell<u64>,
+}
+
+impl RNN {
+    pub fn new(hidden_size: usize) -> Self {
+        RNN {
+            x2h: Linear::new(hidden_size, 99),
+            w_h: RefCell::new(None),
+            h: RefCell::new(None),
+            hidden_size,
+            rng_state: Cell::new(77),
+        }
+    }
+
+    fn next_f64(&self) -> f64 {
+        let state = self.rng_state.get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state.set(state);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_normal(&self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    pub fn reset_state(&self) {
+        *self.h.borrow_mut() = None;
+    }
+
+    pub fn forward(&self, x: &Variable) -> Variable {
+        // w_h lazy init: 첫 호출 시 Xavier 초기화
+        if self.w_h.borrow().is_none() {
+            let scale = (1.0 / self.hidden_size as f64).sqrt();
+            let w_data: Vec<f64> = (0..self.hidden_size * self.hidden_size)
+                .map(|_| self.next_normal() * scale)
+                .collect();
+            *self.w_h.borrow_mut() = Some(Variable::new(
+                ArrayD::from_shape_vec(
+                    ndarray::IxDyn(&[self.hidden_size, self.hidden_size]),
+                    w_data,
+                ).unwrap(),
+            ));
+        }
+
+        let h_new = if self.h.borrow().is_none() {
+            // 첫 스텝: h가 없으므로 x2h만 사용
+            tanh(&self.x2h.forward(x))
+        } else {
+            // 이후 스텝: x2h(x) + h @ W_h
+            let h = self.h.borrow().clone().unwrap();
+            let w_h = self.w_h.borrow().as_ref().unwrap().clone();
+            tanh(&(&self.x2h.forward(x) + &matmul(&h, &w_h)))
+        };
+
+        *self.h.borrow_mut() = Some(h_new.clone());
+        h_new
+    }
+
+    pub fn cleargrads(&self) {
+        self.x2h.cleargrads();
+        if let Some(w) = self.w_h.borrow().as_ref() {
+            w.cleargrad();
+        }
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut params = self.x2h.params();
+        if let Some(w) = self.w_h.borrow().as_ref() {
+            params.push(w.clone());
+        }
+        params
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
@@ -1601,6 +1718,80 @@ impl<'a> SGD<'a> {
         for p in model.params() {
             let grad = p.grad().unwrap();
             p.set_data(&p.data() - &grad.mapv(|v| v * self.lr));
+        }
+    }
+}
+
+/// Adam 옵티마이저 (Kingma & Ba, 2015)
+///
+/// SGD는 모든 파라미터에 동일한 학습률을 적용하지만,
+/// Adam은 각 파라미터별로 적응적 학습률을 사용한다.
+///
+/// 업데이트 규칙:
+///   m ← β₁·m + (1-β₁)·grad        (1차 모멘트: 기울기의 지수 이동평균)
+///   v ← β₂·v + (1-β₂)·grad²       (2차 모멘트: 기울기 제곱의 이동평균)
+///   lr_t = lr × √(1-β₂ᵗ) / (1-β₁ᵗ)  (바이어스 보정된 학습률)
+///   p ← p - lr_t × m / (√v + ε)
+///
+/// 기본값: lr=0.001, β₁=0.9, β₂=0.999, ε=1e-8
+pub struct Adam {
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    ms: RefCell<Vec<ArrayD<f64>>>,
+    vs: RefCell<Vec<ArrayD<f64>>>,
+    t: Cell<u32>,
+}
+
+impl Adam {
+    pub fn new(lr: f64) -> Self {
+        Adam {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            ms: RefCell::new(Vec::new()),
+            vs: RefCell::new(Vec::new()),
+            t: Cell::new(0),
+        }
+    }
+
+    /// 파라미터를 Adam 규칙으로 업데이트
+    /// params는 매 호출마다 동일한 순서로 전달해야 함 (모멘트 벡터와 1:1 대응)
+    /// Lazy init: 첫 호출 시 또는 shape가 변하면 모멘트를 0으로 초기화
+    pub fn update(&self, params: &[Variable]) {
+        self.t.set(self.t.get() + 1);
+        let t = self.t.get() as f64;
+        let fix1 = 1.0 - self.beta1.powf(t);
+        let fix2 = 1.0 - self.beta2.powf(t);
+        let lr_t = self.lr * fix2.sqrt() / fix1;
+
+        let mut ms = self.ms.borrow_mut();
+        let mut vs = self.vs.borrow_mut();
+
+        // 모멘트 벡터를 파라미터 수에 맞게 확장
+        while ms.len() < params.len() {
+            ms.push(ArrayD::zeros(ndarray::IxDyn(&[0])));
+            vs.push(ArrayD::zeros(ndarray::IxDyn(&[0])));
+        }
+
+        for (i, p) in params.iter().enumerate() {
+            if let Some(grad) = p.grad() {
+                // 첫 사용 시 올바른 shape로 초기화
+                if ms[i].shape() != grad.shape() {
+                    ms[i] = ArrayD::zeros(grad.raw_dim());
+                    vs[i] = ArrayD::zeros(grad.raw_dim());
+                }
+
+                // m ← β₁·m + (1-β₁)·grad
+                ms[i] = &ms[i] * self.beta1 + &grad * (1.0 - self.beta1);
+                // v ← β₂·v + (1-β₂)·grad²
+                vs[i] = &vs[i] * self.beta2 + &(&grad * &grad) * (1.0 - self.beta2);
+                // p ← p - lr_t · m / (√v + ε)
+                let update = ms[i].mapv(|m| m * lr_t) / vs[i].mapv(|v| v.sqrt() + self.eps);
+                p.set_data(&p.data() - &update);
+            }
         }
     }
 }
@@ -1869,6 +2060,54 @@ fn load_mnist_labels(gz_path: &str) -> Vec<usize> {
         .iter()
         .map(|&b| b as usize)
         .collect()
+}
+
+/// SinCurve 데이터셋: 사인 곡선의 다음 값을 예측하는 시계열 데이터
+///
+/// RNN 학습용: x[i] = sin(2π·i/T), t[i] = sin(2π·(i+1)/T)
+/// 현재 값을 입력으로 받아 다음 시간 스텝의 값을 예측
+///
+/// train=true: 전체의 80% (앞부분)
+/// train=false: 전체의 20% (뒷부분)
+pub struct SinCurve {
+    x: Vec<f64>,
+    t: Vec<f64>,
+}
+
+impl SinCurve {
+    pub fn new(train: bool) -> Self {
+        let num_data = 1000;
+        let period = 25.0;
+
+        // 전체 사인 곡선 생성
+        let y: Vec<f64> = (0..num_data)
+            .map(|i| (2.0 * std::f64::consts::PI * i as f64 / period).sin())
+            .collect();
+
+        let split = (num_data as f64 * 0.8) as usize; // 800
+
+        let (x, t) = if train {
+            // (y[0],y[1]), (y[1],y[2]), ..., (y[split-2],y[split-1])
+            (y[..split - 1].to_vec(), y[1..split].to_vec())
+        } else {
+            (y[split - 1..num_data - 1].to_vec(), y[split..num_data].to_vec())
+        };
+
+        SinCurve { x, t }
+    }
+
+    pub fn len(&self) -> usize {
+        self.x.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.x.is_empty()
+    }
+
+    /// i번째 샘플: (입력값, 목표값)
+    pub fn get(&self, i: usize) -> (f64, f64) {
+        (self.x[i], self.t[i])
+    }
 }
 
 // --- DataLoader ---
