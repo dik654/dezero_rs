@@ -211,6 +211,10 @@ path = "steps/step62.rs"
 name = "step63"
 path = "steps/step63.rs"
 
+[[test]]
+name = "step64"
+path = "steps/step64.rs"
+
 [dependencies]
 ndarray = "0.16"
 ureq = "3"

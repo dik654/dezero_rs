@@ -1235,6 +1235,182 @@ pub fn causal_mask(x: &Variable) -> Variable {
     Func::new(CausalMaskFn).call(&[x])
 }
 
+/// LayerNorm: 마지막 축(feature)을 따라 정규화
+/// y = gamma * (x - mean) / sqrt(var + eps) + beta
+///
+/// BatchNorm은 배치 방향으로 정규화하지만,
+/// LayerNorm은 각 샘플 내에서 feature 방향으로 정규화.
+/// 배치 크기에 의존하지 않아 Transformer에서 표준.
+///
+/// 역전파:
+///   gbeta = sum(gy, batch_dims)
+///   ggamma = sum(gy * x_hat, batch_dims)
+///   gx = (1/sigma) * (g_xhat - mean(g_xhat) - x_hat * mean(g_xhat * x_hat))
+///   where g_xhat = gy * gamma
+struct LayerNormFn {
+    eps: f64,
+    x_hat: RefCell<ArrayD<f64>>,
+    std_inv: RefCell<ArrayD<f64>>,
+}
+
+impl Function for LayerNormFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0];      // (..., D)
+        let gamma = &xs[1];  // (D,)
+        let beta = &xs[2];   // (D,)
+        let ndim = x.ndim();
+        let last = ndim - 1;
+
+        // mean along last axis → (...,) → reshape to (..., 1) for broadcast
+        let mean = x.mean_axis(ndarray::Axis(last)).unwrap();
+        let mut mean_shape = mean.shape().to_vec();
+        mean_shape.push(1);
+        let mean = mean
+            .into_shape_with_order(ndarray::IxDyn(&mean_shape))
+            .unwrap();
+
+        let x_centered = x - &mean;
+
+        // variance along last axis
+        let var = x_centered.mapv(|v| v * v).mean_axis(ndarray::Axis(last)).unwrap();
+        let mut var_shape = var.shape().to_vec();
+        var_shape.push(1);
+        let var = var
+            .into_shape_with_order(ndarray::IxDyn(&var_shape))
+            .unwrap();
+
+        let std_inv = var.mapv(|v| 1.0 / (v + self.eps).sqrt());
+        let x_hat = &x_centered * &std_inv;
+
+        // y = gamma * x_hat + beta (gamma, beta는 (D,)이므로 마지막 축에 broadcast)
+        let y = &x_hat * gamma + beta;
+
+        *self.x_hat.borrow_mut() = x_hat;
+        *self.std_inv.borrow_mut() = std_inv;
+        vec![y]
+    }
+
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gy = gys[0].data();          // (..., D)
+        let gamma = _xs[1].data();       // (D,)
+        let x_hat = self.x_hat.borrow(); // (..., D)
+        let std_inv = self.std_inv.borrow(); // (..., 1)
+        let ndim = gy.ndim();
+        let d = gy.shape()[ndim - 1];
+
+        // 배치 차원을 평탄화: (..., D) → (batch, D)
+        let batch: usize = gy.shape()[..ndim - 1].iter().product::<usize>().max(1);
+
+        // gbeta = sum(gy, batch_dims) → (D,)
+        let gy_2d = gy
+            .as_standard_layout()
+            .into_owned()
+            .into_shape_with_order(ndarray::IxDyn(&[batch, d]))
+            .unwrap();
+        let gbeta_arr = gy_2d.sum_axis(ndarray::Axis(0));
+
+        // ggamma = sum(gy * x_hat, batch_dims) → (D,)
+        let xh_2d = x_hat
+            .as_standard_layout()
+            .into_owned()
+            .into_shape_with_order(ndarray::IxDyn(&[batch, d]))
+            .unwrap();
+        let gy_xhat = &gy_2d * &xh_2d;
+        let ggamma_arr = gy_xhat.sum_axis(ndarray::Axis(0));
+
+        // gx: g_xhat = gy * gamma → (..., D)
+        let g_xhat = &gy * &gamma;
+
+        // mean(g_xhat, last_axis, keepdims) → (..., 1)
+        let g_xhat_mean = g_xhat.mean_axis(ndarray::Axis(ndim - 1)).unwrap();
+        let mut ms = g_xhat_mean.shape().to_vec();
+        ms.push(1);
+        let g_xhat_mean = g_xhat_mean
+            .into_shape_with_order(ndarray::IxDyn(&ms))
+            .unwrap();
+
+        // mean(g_xhat * x_hat, last_axis, keepdims) → (..., 1)
+        let x_hat_ref: &ArrayD<f64> = &x_hat;
+        let g_xhat_xhat = &g_xhat * x_hat_ref;
+        let g_xhat_xhat_mean = g_xhat_xhat.mean_axis(ndarray::Axis(ndim - 1)).unwrap();
+        let mut ms2 = g_xhat_xhat_mean.shape().to_vec();
+        ms2.push(1);
+        let g_xhat_xhat_mean = g_xhat_xhat_mean
+            .into_shape_with_order(ndarray::IxDyn(&ms2))
+            .unwrap();
+
+        // gx = std_inv * (g_xhat - mean(g_xhat) - x_hat * mean(g_xhat * x_hat))
+        let term = &g_xhat - &g_xhat_mean - &(x_hat_ref * &g_xhat_xhat_mean);
+        let std_inv_ref: &ArrayD<f64> = &std_inv;
+        let gx = std_inv_ref * &term;
+
+        vec![
+            Variable::new(gx),
+            Variable::new(ggamma_arr.into_dyn()),
+            Variable::new(gbeta_arr.into_dyn()),
+        ]
+    }
+
+    fn name(&self) -> &str { "LayerNorm" }
+}
+
+/// LayerNorm: 마지막 축에 대해 정규화
+pub fn layer_norm(x: &Variable, gamma: &Variable, beta: &Variable, eps: f64) -> Variable {
+    Func::new(LayerNormFn {
+        eps,
+        x_hat: RefCell::new(ArrayD::zeros(ndarray::IxDyn(&[]))),
+        std_inv: RefCell::new(ArrayD::zeros(ndarray::IxDyn(&[]))),
+    }).call(&[x, gamma, beta])
+}
+
+/// GELU: Gaussian Error Linear Unit
+/// GELU(x) = 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
+///
+/// ReLU의 "hard" 전환 대신 확률적으로 부드러운 전환.
+/// x가 매우 음수면 ≈0, 매우 양수면 ≈x, 전환 구간에서 부드러운 S자.
+/// GPT-2/3에서 사용하는 tanh 근사 버전.
+///
+/// 역전파:
+///   u = √(2/π)(x + 0.044715x³)
+///   du/dx = √(2/π)(1 + 0.134145x²)
+///   gx = gy * [0.5(1 + tanh(u)) + 0.5x·sech²(u)·du/dx]
+struct GELUFn;
+
+impl Function for GELUFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0];
+        let sqrt_2_pi = (2.0_f64 / std::f64::consts::PI).sqrt();
+        let y = x.mapv(|v| {
+            let u = sqrt_2_pi * (v + 0.044715 * v.powi(3));
+            0.5 * v * (1.0 + u.tanh())
+        });
+        vec![y]
+    }
+
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let x = xs[0].data();
+        let gy = gys[0].data();
+        let sqrt_2_pi = (2.0_f64 / std::f64::consts::PI).sqrt();
+
+        let gx = ndarray::Zip::from(&gy).and(&x).map_collect(|&gy_v, &x_v| {
+            let u = sqrt_2_pi * (x_v + 0.044715 * x_v.powi(3));
+            let tanh_u = u.tanh();
+            let sech2_u = 1.0 - tanh_u * tanh_u;
+            let du_dx = sqrt_2_pi * (1.0 + 0.134145 * x_v * x_v);
+            gy_v * (0.5 * (1.0 + tanh_u) + 0.5 * x_v * sech2_u * du_dx)
+        });
+
+        vec![Variable::new(gx.into_dyn())]
+    }
+
+    fn name(&self) -> &str { "GELU" }
+}
+
+/// GELU 활성화: Transformer FFN의 표준 활성화 함수
+pub fn gelu(x: &Variable) -> Variable {
+    Func::new(GELUFn).call(&[x])
+}
+
 pub fn matmul(x: &Variable, w: &Variable) -> Variable {
     Func::new(MatMulFn).call(&[x, w])
 }
@@ -2051,6 +2227,39 @@ impl Embedding {
 
     pub fn params(&self) -> Vec<Variable> {
         vec![self.w.clone()]
+    }
+}
+
+/// LayerNorm 레이어: 마지막 축을 따라 정규화
+/// gamma (스케일)과 beta (시프트)를 학습 파라미터로 보유
+/// gamma 초기값: 1 (정규화된 값을 그대로 유지)
+/// beta 초기값: 0 (시프트 없음)
+pub struct LayerNorm {
+    gamma: Variable,
+    beta: Variable,
+    eps: f64,
+}
+
+impl LayerNorm {
+    pub fn new(d: usize) -> Self {
+        LayerNorm {
+            gamma: Variable::new(ArrayD::ones(ndarray::IxDyn(&[d]))),
+            beta: Variable::new(ArrayD::zeros(ndarray::IxDyn(&[d]))),
+            eps: 1e-5,
+        }
+    }
+
+    pub fn forward(&self, x: &Variable) -> Variable {
+        layer_norm(x, &self.gamma, &self.beta, self.eps)
+    }
+
+    pub fn cleargrads(&self) {
+        self.gamma.cleargrad();
+        self.beta.cleargrad();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        vec![self.gamma.clone(), self.beta.clone()]
     }
 }
 
