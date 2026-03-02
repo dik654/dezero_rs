@@ -1307,6 +1307,82 @@ pub fn conv2d_simple(x: &Variable, w: &Variable, b: Option<&Variable>, stride: u
     }
 }
 
+/// Embedding 순전파/역전파 함수
+///
+/// 순전파: 정수 인덱스 → 임베딩 벡터 룩업
+///   W: (vocab_size, embed_dim) 가중치 테이블
+///   idx: (N,) 또는 (N, T) 정수 인덱스 (f64로 전달, 내부에서 usize 변환)
+///   출력: (..., embed_dim) — 인덱스 위치의 행 벡터를 가져옴
+///
+/// 역전파: scatter-add
+///   gy: (..., embed_dim) 상위 기울기
+///   gW: (vocab_size, embed_dim) — 각 인덱스 위치에 gy를 누적
+///   gW[idx[i]] += gy[i]  (동일 인덱스면 합산)
+struct EmbeddingFn {
+    vocab_size: usize,
+    idx_data: Vec<usize>,
+    input_shape: Vec<usize>,
+}
+
+impl Function for EmbeddingFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let w = &xs[0]; // (vocab_size, embed_dim)
+        let idx = &xs[1]; // 정수 인덱스 (f64로 인코딩)
+        let embed_dim = w.shape()[1];
+
+        // 인덱스에서 벡터를 룩업
+        let indices: Vec<usize> = idx.iter().map(|&v| v as usize).collect();
+        let n = indices.len();
+        let mut out_data = Vec::with_capacity(n * embed_dim);
+        for &i in &indices {
+            let row = w.slice(ndarray::s![i, ..]);
+            out_data.extend(row.iter());
+        }
+
+        // 출력 shape: input_shape + [embed_dim]
+        let mut out_shape = idx.shape().to_vec();
+        out_shape.push(embed_dim);
+        let out = ArrayD::from_shape_vec(ndarray::IxDyn(&out_shape), out_data).unwrap();
+        vec![out]
+    }
+
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gy = &gys[0]; // (..., embed_dim)
+        let gy_data = gy.data();
+        let embed_dim = gy_data.shape()[gy_data.ndim() - 1];
+
+        // scatter-add: gW[idx[i]] += gy[i]
+        let mut gw_data = ArrayD::zeros(ndarray::IxDyn(&[self.vocab_size, embed_dim]));
+        let gy_2d = gy_data.view().into_shape_with_order(ndarray::IxDyn(&[self.idx_data.len(), embed_dim])).unwrap();
+        for (i, &idx) in self.idx_data.iter().enumerate() {
+            let row = gy_2d.slice(ndarray::s![i, ..]);
+            let mut target = gw_data.slice_mut(ndarray::s![idx, ..]);
+            target += &row;
+        }
+
+        // gW (W에 대한 기울기), gidx는 None (정수 인덱스는 미분 불가)
+        let gw = Variable::new(gw_data);
+        let gidx = Variable::new(ArrayD::zeros(ndarray::IxDyn(&self.input_shape)));
+        vec![gw, gidx]
+    }
+
+    fn name(&self) -> &str {
+        "Embedding"
+    }
+}
+
+/// 임베딩 룩업: 정수 인덱스 → 벡터
+/// W: (vocab_size, embed_dim), idx: 정수 인덱스 Variable
+pub fn embedding(w: &Variable, idx: &Variable) -> Variable {
+    let idx_data: Vec<usize> = idx.data().iter().map(|&v| v as usize).collect();
+    let vocab_size = w.shape()[0];
+    Func::new(EmbeddingFn {
+        vocab_size,
+        idx_data,
+        input_shape: idx.shape(),
+    }).call(&[w, idx])
+}
+
 /// 선형 변환: y = x @ W + b
 /// matmul과 add의 조합이므로 역전파는 자동으로 처리됨
 pub fn linear(x: &Variable, w: &Variable, b: Option<&Variable>) -> Variable {
@@ -1670,6 +1746,66 @@ impl LSTM {
     }
 }
 
+/// Embedding 레이어: 정수 인덱스 → 밀집 벡터 변환
+///
+/// 자연어 처리의 기초: 단어(정수 ID)를 의미 있는 벡터 공간으로 매핑
+///   "cat" → [0.2, -0.5, 0.8, ...]  (embed_dim 차원)
+///   "dog" → [0.3, -0.4, 0.7, ...]  (의미적으로 가까운 벡터)
+///
+/// 내부적으로는 (vocab_size, embed_dim) 크기의 가중치 행렬 W에서
+/// 입력 인덱스에 해당하는 행을 꺼내는 룩업 연산
+/// W[3] = W의 3번째 행 → 인덱스 3에 대응하는 임베딩 벡터
+///
+/// one-hot @ W와 동일하지만, 실제로 one-hot 벡터를 만들지 않고 직접 인덱싱
+/// → 메모리/연산 효율적
+pub struct Embedding {
+    w: Variable,
+}
+
+impl Embedding {
+    /// vocab_size: 어휘 크기 (고유 토큰 수)
+    /// embed_dim: 임베딩 벡터 차원
+    pub fn new(vocab_size: usize, embed_dim: usize, seed: u64) -> Self {
+        // Xavier 초기화
+        let mut rng_state = seed;
+        let scale = (1.0 / embed_dim as f64).sqrt();
+        let w_data: Vec<f64> = (0..vocab_size * embed_dim)
+            .map(|_| {
+                // LCG
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u1 = (rng_state >> 11) as f64 / (1u64 << 53) as f64;
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u2 = (rng_state >> 11) as f64 / (1u64 << 53) as f64;
+                // Box-Muller
+                let normal = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                normal * scale
+            })
+            .collect();
+        Embedding {
+            w: Variable::new(
+                ArrayD::from_shape_vec(ndarray::IxDyn(&[vocab_size, embed_dim]), w_data).unwrap(),
+            ),
+        }
+    }
+
+    /// idx: 정수 인덱스 Variable (값은 f64이지만 정수로 해석)
+    pub fn forward(&self, idx: &Variable) -> Variable {
+        embedding(&self.w, idx)
+    }
+
+    pub fn cleargrads(&self) {
+        self.w.cleargrad();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        vec![self.w.clone()]
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
@@ -1952,6 +2088,77 @@ impl Adam {
                 // p ← p - lr_t · m / (√v + ε)
                 let update = ms[i].mapv(|m| m * lr_t) / vs[i].mapv(|v| v.sqrt() + self.eps);
                 p.set_data(&p.data() - &update);
+            }
+        }
+    }
+}
+
+/// AdamW 옵티마이저: Adam + 분리된 가중치 감쇠 (Weight Decay Decoupled)
+///
+/// Adam과의 차이:
+///   Adam:  p ← p - lr_t × m / (√v + ε)                    ← L2 정규화와 혼합
+///   AdamW: p ← p - lr_t × m / (√v + ε) - lr × wd × p     ← 가중치 감쇠를 분리
+///
+/// 왜 분리하는가?
+///   Adam에서 L2 정규화(grad += wd * p)를 쓰면, 적응적 학습률 m/√v가
+///   정규화 항도 스케일링해버린다 → 의도한 감쇠 강도와 달라짐
+///   AdamW는 가중치 감쇠를 Adam 업데이트 밖에서 따로 적용 → 정확한 감쇠
+///
+/// Transformer 학습의 표준 옵티마이저 (GPT, BERT 모두 AdamW 사용)
+pub struct AdamW {
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+    ms: RefCell<Vec<ArrayD<f64>>>,
+    vs: RefCell<Vec<ArrayD<f64>>>,
+    t: Cell<u32>,
+}
+
+impl AdamW {
+    pub fn new(lr: f64, weight_decay: f64) -> Self {
+        AdamW {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay,
+            ms: RefCell::new(Vec::new()),
+            vs: RefCell::new(Vec::new()),
+            t: Cell::new(0),
+        }
+    }
+
+    pub fn update(&self, params: &[Variable]) {
+        self.t.set(self.t.get() + 1);
+        let t = self.t.get() as f64;
+        let fix1 = 1.0 - self.beta1.powf(t);
+        let fix2 = 1.0 - self.beta2.powf(t);
+        let lr_t = self.lr * fix2.sqrt() / fix1;
+
+        let mut ms = self.ms.borrow_mut();
+        let mut vs = self.vs.borrow_mut();
+
+        while ms.len() < params.len() {
+            ms.push(ArrayD::zeros(ndarray::IxDyn(&[0])));
+            vs.push(ArrayD::zeros(ndarray::IxDyn(&[0])));
+        }
+
+        for (i, p) in params.iter().enumerate() {
+            if let Some(grad) = p.grad() {
+                if ms[i].shape() != grad.shape() {
+                    ms[i] = ArrayD::zeros(grad.raw_dim());
+                    vs[i] = ArrayD::zeros(grad.raw_dim());
+                }
+
+                ms[i] = &ms[i] * self.beta1 + &grad * (1.0 - self.beta1);
+                vs[i] = &vs[i] * self.beta2 + &(&grad * &grad) * (1.0 - self.beta2);
+                let adam_update = ms[i].mapv(|m| m * lr_t)
+                    / vs[i].mapv(|v| v.sqrt() + self.eps);
+                // AdamW: 가중치 감쇠를 Adam 업데이트와 분리
+                let wd_update = p.data().mapv(|w| w * self.lr * self.weight_decay);
+                p.set_data(&(&p.data() - &adam_update) - &wd_update);
             }
         }
     }
