@@ -987,6 +987,116 @@ pub fn transpose(x: &Variable) -> Variable {
     Func::new(TransposeFn).call(&[x])
 }
 
+/// 임의 축 순열 전치: axes로 차원 순서를 재배치
+/// 예: (B, H, T, D).transpose_axes([0, 2, 1, 3]) → (B, T, H, D)
+///
+/// 2D 전치(TransposeFn)는 (M, N) → (N, M)만 가능하지만,
+/// Attention에서는 (B, H, T, D) → (B, T, H, D) 같은 임의 축 순열이 필수
+///
+/// 역전파: 역순열(inverse permutation)을 적용
+///   axes = [0, 2, 1, 3]의 역순열도 [0, 2, 1, 3] (자기 자신의 역)
+///   일반적으로 inv_axes[axes[i]] = i
+struct TransposeAxesFn {
+    axes: Vec<usize>,
+    inv_axes: Vec<usize>,
+}
+
+impl Function for TransposeAxesFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let permuted = xs[0].clone().permuted_axes(ndarray::IxDyn(&self.axes));
+        // permuted_axes 후 비연속 메모리일 수 있으므로 연속화
+        vec![permuted.as_standard_layout().into_owned()]
+    }
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        vec![transpose_axes(&gys[0], &self.inv_axes)]
+    }
+    fn name(&self) -> &str { "TransposeAxes" }
+}
+
+pub fn transpose_axes(x: &Variable, axes: &[usize]) -> Variable {
+    // 역순열 계산: inv_axes[axes[i]] = i
+    let mut inv_axes = vec![0; axes.len()];
+    for (i, &a) in axes.iter().enumerate() {
+        inv_axes[a] = i;
+    }
+    Func::new(TransposeAxesFn {
+        axes: axes.to_vec(),
+        inv_axes,
+    }).call(&[x])
+}
+
+/// Batched Matmul: 배치 차원을 유지한 채 마지막 2차원에서 행렬곱
+/// (..., M, K) @ (..., K, N) → (..., M, N)
+///
+/// 일반 matmul(MatMulFn)은 2D (M,K)@(K,N) 전용.
+/// Attention에서는 (B, H, T, D) @ (B, H, D, T) 같은 배치 행렬곱이 필수.
+///
+/// 역전파:
+///   gy: (..., M, N)
+///   gx = gy @ w^T   = batched_matmul(gy, w.transpose(-1,-2))
+///   gw = x^T @ gy   = batched_matmul(x.transpose(-1,-2), gy)
+struct BatchedMatMulFn;
+
+impl Function for BatchedMatMulFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0];
+        let w = &xs[1];
+        let x_shape = x.shape();
+        let w_shape = w.shape();
+        let ndim = x_shape.len();
+
+        let m = x_shape[ndim - 2];
+        let k = x_shape[ndim - 1];
+        let n = w_shape[ndim - 1];
+
+        // 배치 크기 계산: 마지막 2차원을 제외한 모든 차원의 곱
+        let batch: usize = x_shape[..ndim - 2].iter().product();
+
+        // (..., M, K) → (batch, M, K) → 각 배치에서 (M,K) @ (K,N)
+        // transpose_axes 후 비연속 메모리일 수 있으므로 as_standard_layout으로 연속화
+        let x_contig = x.as_standard_layout().into_owned();
+        let w_contig = w.as_standard_layout().into_owned();
+        let x_flat = x_contig.view().into_shape_with_order(ndarray::IxDyn(&[batch, m, k])).unwrap();
+        let w_flat = w_contig.view().into_shape_with_order(ndarray::IxDyn(&[batch, k, n])).unwrap();
+
+        let mut out_data = Vec::with_capacity(batch * m * n);
+        for b in 0..batch {
+            let xb = x_flat.slice(ndarray::s![b, .., ..]);
+            let wb = w_flat.slice(ndarray::s![b, .., ..]);
+            let yb = xb.dot(&wb);
+            out_data.extend(yb.iter());
+        }
+
+        let mut out_shape = x_shape[..ndim - 2].to_vec();
+        out_shape.push(m);
+        out_shape.push(n);
+        vec![ArrayD::from_shape_vec(ndarray::IxDyn(&out_shape), out_data).unwrap()]
+    }
+
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        // gx = gy @ w^T
+        let w_t = swap_last_two(&xs[1]);
+        let gx = batched_matmul(&gys[0], &w_t);
+        // gw = x^T @ gy
+        let x_t = swap_last_two(&xs[0]);
+        let gw = batched_matmul(&x_t, &gys[0]);
+        vec![gx, gw]
+    }
+    fn name(&self) -> &str { "BatchedMatMul" }
+}
+
+/// 마지막 두 차원을 교환하는 헬퍼: (..., M, N) → (..., N, M)
+fn swap_last_two(x: &Variable) -> Variable {
+    let ndim = x.shape().len();
+    let mut axes: Vec<usize> = (0..ndim).collect();
+    axes.swap(ndim - 2, ndim - 1);
+    transpose_axes(x, &axes)
+}
+
+pub fn batched_matmul(x: &Variable, w: &Variable) -> Variable {
+    Func::new(BatchedMatMulFn).call(&[x, w])
+}
+
 pub fn matmul(x: &Variable, w: &Variable) -> Variable {
     Func::new(MatMulFn).call(&[x, w])
 }
