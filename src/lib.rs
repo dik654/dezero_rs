@@ -1097,6 +1097,144 @@ pub fn batched_matmul(x: &Variable, w: &Variable) -> Variable {
     Func::new(BatchedMatMulFn).call(&[x, w])
 }
 
+/// Softmax(axis): 임의 축을 따라 softmax 적용
+/// softmax(x)_i = exp(x_i - max) / Σ exp(x_j - max)
+///
+/// 기존 softmax_simple은 2D 텐서의 axis=1 전용.
+/// Attention에서는 4D 텐서 (B, H, T, T)의 마지막 축(axis=-1)에 softmax 필요.
+///
+/// 수치 안정성: max를 빼서 exp의 오버플로 방지
+/// 역전파: gx = y * (gy - sum(gy * y, axis, keepdims))
+///   야코비안 ∂y_i/∂x_j = y_i(δ_ij - y_j)에서 유도
+struct SoftmaxAxisFn {
+    axis: usize,
+    output: RefCell<ArrayD<f64>>,
+}
+
+impl Function for SoftmaxAxisFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0];
+        let axis = self.axis;
+
+        // 수치 안정성: max를 빼서 가장 큰 값이 0이 되게 함
+        let max_vals = x.map_axis(ndarray::Axis(axis), |lane| {
+            lane.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        });
+        let mut max_shape = max_vals.shape().to_vec();
+        max_shape.insert(axis, 1);
+        let max_broadcast = max_vals
+            .into_shape_with_order(ndarray::IxDyn(&max_shape))
+            .unwrap();
+
+        let shifted = x - &max_broadcast;
+        let exp_x = shifted.mapv(f64::exp);
+
+        let sum_exp = exp_x.sum_axis(ndarray::Axis(axis));
+        let mut sum_shape = sum_exp.shape().to_vec();
+        sum_shape.insert(axis, 1);
+        let sum_broadcast = sum_exp
+            .into_shape_with_order(ndarray::IxDyn(&sum_shape))
+            .unwrap();
+
+        let y = &exp_x / &sum_broadcast;
+        *self.output.borrow_mut() = y.clone();
+        vec![y]
+    }
+
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        // gx = y * (gy - sum(gy * y, axis, keepdims=true))
+        let y = self.output.borrow();
+        let gy = gys[0].data();
+        let axis = self.axis;
+
+        let y_arr: &ArrayD<f64> = &y;
+        let gy_y = &gy * y_arr;
+        let sum_gy_y = gy_y.sum_axis(ndarray::Axis(axis));
+        let mut sum_shape = sum_gy_y.shape().to_vec();
+        sum_shape.insert(axis, 1);
+        let sum_broadcast = sum_gy_y
+            .into_shape_with_order(ndarray::IxDyn(&sum_shape))
+            .unwrap();
+
+        let diff = &gy - &sum_broadcast;
+        let gx = y_arr * &diff;
+        vec![Variable::new(gx)]
+    }
+
+    fn name(&self) -> &str { "Softmax" }
+}
+
+/// 임의 축에 대한 softmax
+/// axis: 음수 지원 (-1 = 마지막 축)
+pub fn softmax(x: &Variable, axis: isize) -> Variable {
+    let ndim = x.shape().len();
+    let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+    Func::new(SoftmaxAxisFn {
+        axis,
+        output: RefCell::new(ArrayD::zeros(ndarray::IxDyn(&[]))),
+    }).call(&[x])
+}
+
+/// Causal Mask: 미래 토큰을 차단하는 삼각 마스크
+/// 마지막 두 차원 (T, T)에서 col > row인 위치를 -∞로 설정
+///
+/// Attention에서 scores (B, H, T, T)에 적용:
+///   token i는 token 0..=i만 참조 가능 (자기자신 포함, 미래 불가)
+///
+/// 역전파: 마스크된 위치(-∞)의 기울기는 0, 나머지는 그대로 통과
+struct CausalMaskFn;
+
+impl Function for CausalMaskFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let mut y = xs[0].clone();
+        let shape = y.shape().to_vec();
+        let ndim = shape.len();
+        let t_row = shape[ndim - 2];
+        let t_col = shape[ndim - 1];
+
+        // 배치 차원 평탄화: (..., T, T) → (batch, T, T)
+        let batch: usize = shape[..ndim - 2].iter().product::<usize>().max(1);
+        let stride = t_row * t_col;
+        let y_slice = y.as_slice_mut().unwrap();
+        for b in 0..batch {
+            for i in 0..t_row {
+                for j in (i + 1)..t_col {
+                    y_slice[b * stride + i * t_col + j] = f64::NEG_INFINITY;
+                }
+            }
+        }
+        vec![y]
+    }
+
+    fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let gy = gys[0].data();
+        let shape = gy.shape().to_vec();
+        let ndim = shape.len();
+        let t_row = shape[ndim - 2];
+        let t_col = shape[ndim - 1];
+
+        let batch: usize = shape[..ndim - 2].iter().product::<usize>().max(1);
+        let stride = t_row * t_col;
+        let mut gx = gy.clone();
+        let gx_slice = gx.as_slice_mut().unwrap();
+        for b in 0..batch {
+            for i in 0..t_row {
+                for j in (i + 1)..t_col {
+                    gx_slice[b * stride + i * t_col + j] = 0.0;
+                }
+            }
+        }
+        vec![Variable::new(gx)]
+    }
+
+    fn name(&self) -> &str { "CausalMask" }
+}
+
+/// Causal mask 적용: 미래 토큰 위치를 -∞로 마스킹
+pub fn causal_mask(x: &Variable) -> Variable {
+    Func::new(CausalMaskFn).call(&[x])
+}
+
 pub fn matmul(x: &Variable, w: &Variable) -> Variable {
     Func::new(MatMulFn).call(&[x, w])
 }
