@@ -2414,6 +2414,157 @@ impl TransformerBlock {
     }
 }
 
+/// GPT: 완전한 Decoder-only Transformer 언어 모델
+///
+/// 구조:
+///   token_ids (B,T) → Token Embedding + Position Embedding
+///   → TransformerBlock × N → LayerNorm → Linear(vocab_size)
+///   → logits (B, T, vocab_size)
+///
+/// 각 위치 t의 logit은 다음 토큰(t+1)의 확률 분포를 나타낸다.
+/// 학습: softmax_cross_entropy로 다음 토큰 예측 loss 계산
+/// 생성: 마지막 위치의 logit에서 argmax로 다음 토큰 선택, 자기회귀 반복
+pub struct GPT {
+    token_emb: Embedding,
+    pos_emb: Embedding,
+    blocks: Vec<TransformerBlock>,
+    ln_f: LayerNorm,
+    lm_head: Linear,
+    block_size: usize,
+    n_embd: usize,
+    vocab_size: usize,
+}
+
+impl GPT {
+    /// block_size: 최대 시퀀스 길이
+    pub fn new(
+        vocab_size: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_layer: usize,
+        block_size: usize,
+        dropout: f64,
+        seed: u64,
+    ) -> Self {
+        let mut blocks = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            blocks.push(TransformerBlock::new(
+                n_embd, n_head, dropout,
+                seed.wrapping_add(1000 * (i as u64 + 1)),
+            ));
+        }
+        GPT {
+            token_emb: Embedding::new(vocab_size, n_embd, seed),
+            pos_emb: Embedding::new(block_size, n_embd, seed.wrapping_add(1)),
+            blocks,
+            ln_f: LayerNorm::new(n_embd),
+            lm_head: Linear::new(vocab_size, seed.wrapping_add(2)),
+            block_size,
+            n_embd,
+            vocab_size,
+        }
+    }
+
+    /// idx: (B, T) 정수 토큰 인덱스 → logits: (B, T, vocab_size)
+    pub fn forward(&self, idx: &Variable) -> Variable {
+        let shape = idx.shape();
+        let (b, t) = (shape[0], shape[1]);
+
+        // 토큰 임베딩: (B, T) → (B, T, D)
+        let tok_emb = self.token_emb.forward(idx);
+
+        // 위치 임베딩: [0, 1, ..., T-1] → (T, D) → broadcast to (B, T, D)
+        let pos_idx = Variable::new(
+            ArrayD::from_shape_vec(
+                ndarray::IxDyn(&[t]),
+                (0..t).map(|i| i as f64).collect(),
+            ).unwrap()
+        );
+        let pos_emb = self.pos_emb.forward(&pos_idx); // (T, D)
+        // (B, T, D) + (T, D) — ndarray가 자동 broadcast
+        let mut x = &tok_emb + &pos_emb;
+
+        // Transformer 블록 × N
+        for block in &self.blocks {
+            x = block.forward(&x);
+        }
+
+        // 최종 LayerNorm
+        x = self.ln_f.forward(&x);
+
+        // LM Head: (B, T, D) → (B*T, D) → (B*T, V) → (B, T, V)
+        let x_2d = reshape(&x, &[b * t, self.n_embd]);
+        let logits = self.lm_head.forward(&x_2d);
+        reshape(&logits, &[b, t, self.vocab_size])
+    }
+
+    /// Greedy 자기회귀 생성
+    /// start_tokens: 시작 토큰 시퀀스, max_new_tokens: 생성할 토큰 수
+    pub fn generate(&self, start_tokens: &[usize], max_new_tokens: usize) -> Vec<usize> {
+        let _guard = no_grad();
+        let _test = test_mode();
+        let mut tokens = start_tokens.to_vec();
+
+        for _ in 0..max_new_tokens {
+            // 최근 block_size 토큰만 사용 (위치 임베딩 범위 제한)
+            let start = if tokens.len() > self.block_size {
+                tokens.len() - self.block_size
+            } else {
+                0
+            };
+            let ctx = &tokens[start..];
+            let t = ctx.len();
+
+            let idx = Variable::new(
+                ArrayD::from_shape_vec(
+                    ndarray::IxDyn(&[1, t]),
+                    ctx.iter().map(|&v| v as f64).collect(),
+                ).unwrap()
+            );
+
+            let logits = self.forward(&idx); // (1, T, V)
+            let logits_data = logits.data();
+
+            // 마지막 위치의 logit에서 argmax
+            let last_t = t - 1;
+            let mut best_tok = 0;
+            let mut best_val = f64::NEG_INFINITY;
+            for v in 0..self.vocab_size {
+                let val = logits_data[[0, last_t, v]];
+                if val > best_val {
+                    best_val = val;
+                    best_tok = v;
+                }
+            }
+            tokens.push(best_tok);
+        }
+
+        tokens
+    }
+
+    pub fn cleargrads(&self) {
+        self.token_emb.cleargrads();
+        self.pos_emb.cleargrads();
+        for block in &self.blocks {
+            block.cleargrads();
+        }
+        self.ln_f.cleargrads();
+        self.lm_head.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.token_emb.params());
+        p.extend(self.pos_emb.params());
+        for block in &self.blocks {
+            p.extend(block.params());
+        }
+        p.extend(self.ln_f.params());
+        p.extend(self.lm_head.params());
+        p
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
