@@ -2350,6 +2350,70 @@ impl CausalSelfAttention {
     }
 }
 
+/// TransformerBlock: GPT-2 스타일 Transformer 블록 (Pre-LN)
+///
+/// 구조:
+///   x → LayerNorm → CausalSelfAttention → Dropout → +x (residual)
+///     → LayerNorm → FFN(Linear→GELU→Linear) → Dropout → +x (residual) → out
+///
+/// Pre-LN: 정규화를 서브레이어 앞에 배치 (GPT-2/3 표준)
+/// FFN: D → 4D → D로 확장 후 축소 (비선형 변환 용량 확보)
+pub struct TransformerBlock {
+    ln1: LayerNorm,
+    attn: CausalSelfAttention,
+    ln2: LayerNorm,
+    mlp_fc: Linear,      // D → 4D
+    mlp_proj: Linear,    // 4D → D
+    resid_dropout: f64,
+}
+
+impl TransformerBlock {
+    pub fn new(n_embd: usize, n_head: usize, dropout: f64, seed: u64) -> Self {
+        TransformerBlock {
+            ln1: LayerNorm::new(n_embd),
+            attn: CausalSelfAttention::new(n_embd, n_head, dropout, seed),
+            ln2: LayerNorm::new(n_embd),
+            mlp_fc: Linear::new(4 * n_embd, seed.wrapping_add(100)),
+            mlp_proj: Linear::new(n_embd, seed.wrapping_add(101)),
+            resid_dropout: dropout,
+        }
+    }
+
+    /// x: (B, T, D) → (B, T, D)
+    pub fn forward(&self, x: &Variable) -> Variable {
+        let shape = x.shape();
+        let (b, t, d) = (shape[0], shape[1], shape[2]);
+
+        // Sub-block 1: LayerNorm → Attention → Dropout → Residual
+        let h = x + &dropout(&self.attn.forward(&self.ln1.forward(x)), self.resid_dropout);
+
+        // Sub-block 2: LayerNorm → FFN → Dropout → Residual
+        let normed = self.ln2.forward(&h);
+        let normed_2d = reshape(&normed, &[b * t, d]);
+        let ffn_out = self.mlp_proj.forward(&gelu(&self.mlp_fc.forward(&normed_2d)));
+        let ffn_out = reshape(&ffn_out, &[b, t, d]);
+        &h + &dropout(&ffn_out, self.resid_dropout)
+    }
+
+    pub fn cleargrads(&self) {
+        self.ln1.cleargrads();
+        self.attn.cleargrads();
+        self.ln2.cleargrads();
+        self.mlp_fc.cleargrads();
+        self.mlp_proj.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.ln1.params());
+        p.extend(self.attn.params());
+        p.extend(self.ln2.params());
+        p.extend(self.mlp_fc.params());
+        p.extend(self.mlp_proj.params());
+        p
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
