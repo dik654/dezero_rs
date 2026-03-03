@@ -2263,6 +2263,93 @@ impl LayerNorm {
     }
 }
 
+/// CausalSelfAttention: GPT 스타일 Multi-Head Attention
+///
+/// 입력 (B, T, D)에서 Q, K, V를 생성하고, 멀티 헤드로 분할하여
+/// scaled dot-product attention을 수행한 뒤 결합하여 (B, T, D)를 출력
+///
+/// 데이터 흐름:
+///   x (B,T,D) → Q,K,V 프로젝션 → (B,T,H,D_h) → transpose → (B,H,T,D_h)
+///   → Q@K^T/√D_h → causal mask → softmax → dropout → @V
+///   → transpose → (B,T,D) → 출력 프로젝션
+pub struct CausalSelfAttention {
+    n_head: usize,
+    n_embd: usize,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
+    attn_dropout: f64,
+}
+
+impl CausalSelfAttention {
+    pub fn new(n_embd: usize, n_head: usize, dropout: f64, seed: u64) -> Self {
+        assert!(n_embd % n_head == 0, "n_embd must be divisible by n_head");
+        CausalSelfAttention {
+            n_head,
+            n_embd,
+            q_proj: Linear::new(n_embd, seed),
+            k_proj: Linear::new(n_embd, seed.wrapping_add(1)),
+            v_proj: Linear::new(n_embd, seed.wrapping_add(2)),
+            out_proj: Linear::new(n_embd, seed.wrapping_add(3)),
+            attn_dropout: dropout,
+        }
+    }
+
+    /// x: (B, T, D) → (B, T, D)
+    pub fn forward(&self, x: &Variable) -> Variable {
+        let shape = x.shape();
+        let (b, t, d) = (shape[0], shape[1], shape[2]);
+        let d_head = d / self.n_head;
+
+        // (B, T, D) → (B*T, D) — Linear은 2D 입력만 처리
+        let x_2d = reshape(x, &[b * t, d]);
+
+        // Q, K, V 프로젝션: (B*T, D) → (B*T, D)
+        let q = self.q_proj.forward(&x_2d);
+        let k = self.k_proj.forward(&x_2d);
+        let v = self.v_proj.forward(&x_2d);
+
+        // (B*T, D) → (B, T, H, D_head) → transpose → (B, H, T, D_head)
+        let q = transpose_axes(&reshape(&q, &[b, t, self.n_head, d_head]), &[0, 2, 1, 3]);
+        let k = transpose_axes(&reshape(&k, &[b, t, self.n_head, d_head]), &[0, 2, 1, 3]);
+        let v = transpose_axes(&reshape(&v, &[b, t, self.n_head, d_head]), &[0, 2, 1, 3]);
+
+        // Scaled dot-product attention
+        // K^T: (B, H, D_head, T)
+        let k_t = transpose_axes(&k, &[0, 1, 3, 2]);
+        // Q @ K^T / √D_head: (B, H, T, T)
+        let scores = &batched_matmul(&q, &k_t) / (d_head as f64).sqrt();
+        // Causal mask → softmax → dropout
+        let attn = dropout(&softmax(&causal_mask(&scores), -1), self.attn_dropout);
+        // attn @ V: (B, H, T, T) @ (B, H, T, D_head) → (B, H, T, D_head)
+        let out = batched_matmul(&attn, &v);
+
+        // (B, H, T, D_head) → transpose → (B, T, H, D_head) → (B, T, D)
+        let out = reshape(&transpose_axes(&out, &[0, 2, 1, 3]), &[b, t, d]);
+
+        // 출력 프로젝션: (B*T, D) → (B*T, D) → (B, T, D)
+        let out_2d = self.out_proj.forward(&reshape(&out, &[b * t, d]));
+        reshape(&out_2d, &[b, t, d])
+    }
+
+    pub fn cleargrads(&self) {
+        self.q_proj.cleargrads();
+        self.k_proj.cleargrads();
+        self.v_proj.cleargrads();
+        self.out_proj.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.q_proj.params());
+        p.extend(self.k_proj.params());
+        p.extend(self.v_proj.params());
+        p.extend(self.out_proj.params());
+        p
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
