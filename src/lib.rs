@@ -2263,16 +2263,19 @@ impl LayerNorm {
     }
 }
 
-/// CausalSelfAttention: GPT 스타일 Multi-Head Attention
+/// SelfAttention: Multi-Head Self-Attention (causal / bidirectional 겸용)
 ///
 /// 입력 (B, T, D)에서 Q, K, V를 생성하고, 멀티 헤드로 분할하여
 /// scaled dot-product attention을 수행한 뒤 결합하여 (B, T, D)를 출력
 ///
+/// use_causal_mask=true: GPT (미래 토큰 마스킹)
+/// use_causal_mask=false: BERT (양방향 어텐션)
+///
 /// 데이터 흐름:
 ///   x (B,T,D) → Q,K,V 프로젝션 → (B,T,H,D_h) → transpose → (B,H,T,D_h)
-///   → Q@K^T/√D_h → causal mask → softmax → dropout → @V
+///   → Q@K^T/√D_h → [causal mask] → softmax → dropout → @V
 ///   → transpose → (B,T,D) → 출력 프로젝션
-pub struct CausalSelfAttention {
+pub struct SelfAttention {
     n_head: usize,
     n_embd: usize,
     q_proj: Linear,
@@ -2280,12 +2283,22 @@ pub struct CausalSelfAttention {
     v_proj: Linear,
     out_proj: Linear,
     attn_dropout: f64,
+    use_causal_mask: bool,
 }
 
-impl CausalSelfAttention {
+/// 하위 호환 alias: 기존 GPT 코드에서 CausalSelfAttention으로 사용
+pub type CausalSelfAttention = SelfAttention;
+
+impl SelfAttention {
+    /// GPT용: causal mask 적용 (하위 호환)
     pub fn new(n_embd: usize, n_head: usize, dropout: f64, seed: u64) -> Self {
+        Self::new_with_mask(n_embd, n_head, dropout, seed, true)
+    }
+
+    /// causal mask 여부를 직접 지정
+    pub fn new_with_mask(n_embd: usize, n_head: usize, dropout: f64, seed: u64, use_causal_mask: bool) -> Self {
         assert!(n_embd % n_head == 0, "n_embd must be divisible by n_head");
-        CausalSelfAttention {
+        SelfAttention {
             n_head,
             n_embd,
             q_proj: Linear::new(n_embd, seed),
@@ -2293,6 +2306,7 @@ impl CausalSelfAttention {
             v_proj: Linear::new(n_embd, seed.wrapping_add(2)),
             out_proj: Linear::new(n_embd, seed.wrapping_add(3)),
             attn_dropout: dropout,
+            use_causal_mask,
         }
     }
 
@@ -2320,8 +2334,13 @@ impl CausalSelfAttention {
         let k_t = transpose_axes(&k, &[0, 1, 3, 2]);
         // Q @ K^T / √D_head: (B, H, T, T)
         let scores = &batched_matmul(&q, &k_t) / (d_head as f64).sqrt();
-        // Causal mask → softmax → dropout
-        let attn = dropout(&softmax(&causal_mask(&scores), -1), self.attn_dropout);
+        // Causal mask (GPT) 또는 그대로 (BERT) → softmax → dropout
+        let masked_scores = if self.use_causal_mask {
+            causal_mask(&scores)
+        } else {
+            scores
+        };
+        let attn = dropout(&softmax(&masked_scores, -1), self.attn_dropout);
         // attn @ V: (B, H, T, T) @ (B, H, T, D_head) → (B, H, T, D_head)
         let out = batched_matmul(&attn, &v);
 
@@ -2350,17 +2369,20 @@ impl CausalSelfAttention {
     }
 }
 
-/// TransformerBlock: GPT-2 스타일 Transformer 블록 (Pre-LN)
+/// TransformerBlock: Pre-LN Transformer 블록 (GPT/BERT 겸용)
 ///
 /// 구조:
-///   x → LayerNorm → CausalSelfAttention → Dropout → +x (residual)
+///   x → LayerNorm → SelfAttention → Dropout → +x (residual)
 ///     → LayerNorm → FFN(Linear→GELU→Linear) → Dropout → +x (residual) → out
+///
+/// is_causal=true: GPT (미래 토큰 마스킹)
+/// is_causal=false: BERT (양방향 어텐션)
 ///
 /// Pre-LN: 정규화를 서브레이어 앞에 배치 (GPT-2/3 표준)
 /// FFN: D → 4D → D로 확장 후 축소 (비선형 변환 용량 확보)
 pub struct TransformerBlock {
     ln1: LayerNorm,
-    attn: CausalSelfAttention,
+    attn: SelfAttention,
     ln2: LayerNorm,
     mlp_fc: Linear,      // D → 4D
     mlp_proj: Linear,    // 4D → D
@@ -2368,10 +2390,16 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
+    /// GPT용: causal mask 적용 (하위 호환)
     pub fn new(n_embd: usize, n_head: usize, dropout: f64, seed: u64) -> Self {
+        Self::new_with_causal(n_embd, n_head, dropout, seed, true)
+    }
+
+    /// is_causal: true=GPT(단방향), false=BERT(양방향)
+    pub fn new_with_causal(n_embd: usize, n_head: usize, dropout: f64, seed: u64, is_causal: bool) -> Self {
         TransformerBlock {
             ln1: LayerNorm::new(n_embd),
-            attn: CausalSelfAttention::new(n_embd, n_head, dropout, seed),
+            attn: SelfAttention::new_with_mask(n_embd, n_head, dropout, seed, is_causal),
             ln2: LayerNorm::new(n_embd),
             mlp_fc: Linear::new(4 * n_embd, seed.wrapping_add(100)),
             mlp_proj: Linear::new(n_embd, seed.wrapping_add(101)),
@@ -2561,6 +2589,227 @@ impl GPT {
         }
         p.extend(self.ln_f.params());
         p.extend(self.lm_head.params());
+        p
+    }
+}
+
+/// MaskedSoftmaxCrossEntropyFn: 마스크된 위치만 cross-entropy loss 계산
+///
+/// 전체 위치에 softmax를 계산하되, loss와 gradient는 mask=true인 위치만 반영.
+/// 계산 그래프가 유지되어 backward가 정상 동작한다.
+struct MaskedSoftmaxCrossEntropyFn {
+    t: Vec<usize>,    // 정답 클래스 인덱스
+    mask: Vec<bool>,  // true인 위치만 loss에 포함
+}
+
+impl Function for MaskedSoftmaxCrossEntropyFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let x = &xs[0]; // (N, C)
+        let n = x.shape()[0];
+        let c = x.shape()[1];
+
+        let masked_count = self.mask.iter().filter(|&&m| m).count();
+        if masked_count == 0 {
+            return vec![ndarray::arr0(0.0).into_dyn()];
+        }
+
+        // softmax (수치 안정 버전)
+        let mut softmax = ArrayD::zeros(x.raw_dim());
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..c { max_val = max_val.max(x[[i, j]]); }
+            let mut sum_exp = 0.0;
+            for j in 0..c {
+                let e = (x[[i, j]] - max_val).exp();
+                softmax[[i, j]] = e;
+                sum_exp += e;
+            }
+            for j in 0..c { softmax[[i, j]] /= sum_exp; }
+        }
+
+        // cross-entropy: 마스크된 위치만
+        let mut loss = 0.0;
+        for i in 0..n {
+            if self.mask[i] {
+                let p = softmax[[i, self.t[i]]].max(1e-15);
+                loss -= p.ln();
+            }
+        }
+        loss /= masked_count as f64;
+
+        vec![ndarray::arr0(loss).into_dyn()]
+    }
+
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let x_data = xs[0].data();
+        let n = x_data.shape()[0];
+        let c = x_data.shape()[1];
+
+        let masked_count = self.mask.iter().filter(|&&m| m).count();
+
+        // softmax 재계산
+        let mut softmax = ArrayD::zeros(x_data.raw_dim());
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..c { max_val = max_val.max(x_data[[i, j]]); }
+            let mut sum_exp = 0.0;
+            for j in 0..c {
+                let e = (x_data[[i, j]] - max_val).exp();
+                softmax[[i, j]] = e;
+                sum_exp += e;
+            }
+            for j in 0..c { softmax[[i, j]] /= sum_exp; }
+        }
+
+        // gradient: 마스크된 위치만 (softmax - one_hot) / M
+        // 마스크 안 된 위치는 0
+        let mut gx = ArrayD::zeros(x_data.raw_dim());
+        for i in 0..n {
+            if self.mask[i] {
+                for j in 0..c {
+                    gx[[i, j]] = softmax[[i, j]] / masked_count as f64;
+                }
+                gx[[i, self.t[i]]] -= 1.0 / masked_count as f64;
+            }
+        }
+
+        let gy_val = gys[0].data().iter().next().copied().unwrap_or(1.0);
+        let gx = gx.mapv(|v| v * gy_val);
+
+        vec![Variable::new(gx)]
+    }
+
+    fn name(&self) -> &str { "MaskedSoftmaxCrossEntropy" }
+}
+
+/// masked_softmax_cross_entropy: 마스크된 위치만 loss 계산
+///
+/// logits: (N, C) 전체 위치의 logit
+/// targets: 각 위치의 정답 클래스
+/// mask: true인 위치만 loss에 포함 (MLM에서 [MASK] 위치)
+///
+/// loss = -mean_{i ∈ mask} log(softmax(logits_i)[targets_i])
+pub fn masked_softmax_cross_entropy(logits: &Variable, targets: &[usize], mask: &[bool]) -> Variable {
+    Func::new(MaskedSoftmaxCrossEntropyFn {
+        t: targets.to_vec(),
+        mask: mask.to_vec(),
+    }).call(&[logits])
+}
+
+/// BERT: Bidirectional Encoder Transformer (MLM 언어 모델)
+///
+/// GPT와의 핵심 차이:
+///   1. 양방향 어텐션 (causal mask 없음)
+///   2. Segment embedding (문장 A=0 / B=1 구분)
+///   3. MLM: [MASK] 위치의 원래 토큰을 예측
+///
+/// 구조:
+///   token_ids (B,T) + segment_ids (B,T)
+///   → Token Embedding + Position Embedding + Segment Embedding
+///   → TransformerBlock(bidirectional) × N → LayerNorm → Linear(vocab_size)
+///   → logits (B, T, vocab_size)
+pub struct BERT {
+    token_emb: Embedding,
+    pos_emb: Embedding,
+    segment_emb: Embedding,   // 2 → D (문장 A=0, B=1)
+    blocks: Vec<TransformerBlock>,
+    ln_f: LayerNorm,
+    mlm_head: Linear,         // D → vocab_size
+    max_seq_len: usize,
+    n_embd: usize,
+    vocab_size: usize,
+}
+
+impl BERT {
+    pub fn new(
+        vocab_size: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_layer: usize,
+        max_seq_len: usize,
+        dropout: f64,
+        seed: u64,
+    ) -> Self {
+        let mut blocks = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            // is_causal=false → 양방향 어텐션
+            blocks.push(TransformerBlock::new_with_causal(
+                n_embd, n_head, dropout,
+                seed.wrapping_add(1000 * (i as u64 + 1)),
+                false,
+            ));
+        }
+        BERT {
+            token_emb: Embedding::new(vocab_size, n_embd, seed),
+            pos_emb: Embedding::new(max_seq_len, n_embd, seed.wrapping_add(1)),
+            segment_emb: Embedding::new(2, n_embd, seed.wrapping_add(2)),
+            blocks,
+            ln_f: LayerNorm::new(n_embd),
+            mlm_head: Linear::new(vocab_size, seed.wrapping_add(3)),
+            max_seq_len,
+            n_embd,
+            vocab_size,
+        }
+    }
+
+    /// token_ids: (B, T), segment_ids: (B, T) → logits: (B, T, vocab_size)
+    pub fn forward(&self, token_ids: &Variable, segment_ids: &Variable) -> Variable {
+        let shape = token_ids.shape();
+        let (b, t) = (shape[0], shape[1]);
+
+        // 토큰 임베딩: (B, T) → (B, T, D)
+        let tok_emb = self.token_emb.forward(token_ids);
+
+        // 위치 임베딩: [0, 1, ..., T-1] → (T, D) → broadcast to (B, T, D)
+        let pos_idx = Variable::new(
+            ArrayD::from_shape_vec(
+                ndarray::IxDyn(&[t]),
+                (0..t).map(|i| i as f64).collect(),
+            ).unwrap()
+        );
+        let pos_emb = self.pos_emb.forward(&pos_idx); // (T, D)
+
+        // 세그먼트 임베딩: (B, T) → (B, T, D)
+        let seg_emb = self.segment_emb.forward(segment_ids);
+
+        // 3개 임베딩 합산
+        let mut x = &(&tok_emb + &pos_emb) + &seg_emb;
+
+        // Transformer 블록 × N (양방향 어텐션)
+        for block in &self.blocks {
+            x = block.forward(&x);
+        }
+
+        // 최종 LayerNorm
+        x = self.ln_f.forward(&x);
+
+        // MLM Head: (B, T, D) → (B*T, D) → (B*T, V) → (B, T, V)
+        let x_2d = reshape(&x, &[b * t, self.n_embd]);
+        let logits = self.mlm_head.forward(&x_2d);
+        reshape(&logits, &[b, t, self.vocab_size])
+    }
+
+    pub fn cleargrads(&self) {
+        self.token_emb.cleargrads();
+        self.pos_emb.cleargrads();
+        self.segment_emb.cleargrads();
+        for block in &self.blocks {
+            block.cleargrads();
+        }
+        self.ln_f.cleargrads();
+        self.mlm_head.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.token_emb.params());
+        p.extend(self.pos_emb.params());
+        p.extend(self.segment_emb.params());
+        for block in &self.blocks {
+            p.extend(block.params());
+        }
+        p.extend(self.ln_f.params());
+        p.extend(self.mlm_head.params());
         p
     }
 }
