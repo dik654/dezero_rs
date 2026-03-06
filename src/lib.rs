@@ -4185,6 +4185,172 @@ impl<'a> Iterator for DataLoader<'a> {
     }
 }
 
+// --- 벡터 검색 (Vector Search) ---
+
+/// 벡터 유사도/거리 메트릭
+/// Cosine, DotProduct는 유사도 (높을수록 유사)
+/// L2, L1은 거리 (낮을수록 유사)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Metric {
+    Cosine,
+    DotProduct,
+    L2,
+    L1,
+}
+
+/// 코사인 유사도: cos(a, b) = (a · b) / (‖a‖ · ‖b‖)
+/// 범위 [-1, 1]. 방향만 비교하므로 스케일 불변.
+pub fn cosine_similarity_vec(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "dimension mismatch");
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    dot / (norm_a * norm_b + 1e-10)
+}
+
+/// 내적 유사도: a · b = Σ aᵢbᵢ
+/// 정규화된 벡터에서는 cosine과 동일. 크기 정보를 반영.
+pub fn dot_product_vec(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "dimension mismatch");
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// L2 (유클리드) 거리: ‖a - b‖₂ = √Σ(aᵢ - bᵢ)²
+/// 범위 [0, +∞). 가장 직관적인 "직선 거리".
+pub fn l2_distance(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "dimension mismatch");
+    a.iter().zip(b.iter()).map(|(x, y)| {
+        let d = x - y;
+        d * d
+    }).sum::<f64>().sqrt()
+}
+
+/// L1 (맨해튼) 거리: ‖a - b‖₁ = Σ|aᵢ - bᵢ|
+/// 범위 [0, +∞). 이상치에 L2보다 robust.
+pub fn l1_distance(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "dimension mismatch");
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+}
+
+/// Brute Force 벡터 검색 인덱스
+///
+/// 모든 벡터를 메모리에 저장하고, 쿼리 시 전체를 선형 스캔하여 top-k를 반환.
+/// 시간복잡도: O(N·D) per query. 정확한 최근접 탐색(exact NN)의 기준 구현.
+/// 이후 IVF, PQ, HNSW의 recall을 검증하는 ground truth로 사용.
+pub struct BruteForceIndex {
+    vectors: Vec<Vec<f64>>,
+    labels: Vec<String>,
+    dim: usize,
+}
+
+impl BruteForceIndex {
+    /// 빈 인덱스 생성. dim: 벡터 차원 (예: SentenceEmbedding의 n_embd)
+    pub fn new(dim: usize) -> Self {
+        BruteForceIndex {
+            vectors: Vec::new(),
+            labels: Vec::new(),
+            dim,
+        }
+    }
+
+    /// 단일 벡터 추가
+    pub fn add(&mut self, vector: &[f64], label: &str) {
+        debug_assert_eq!(vector.len(), self.dim, "vector dimension mismatch: expected {}, got {}", self.dim, vector.len());
+        self.vectors.push(vector.to_vec());
+        self.labels.push(label.to_string());
+    }
+
+    /// 배치 벡터 추가: (N, D) shape의 ArrayD에서 N개 벡터를 한 번에 추가
+    pub fn add_batch(&mut self, vectors: &ArrayD<f64>, labels: &[String]) {
+        let shape = vectors.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array, got {}D", shape.len());
+        let n = shape[0];
+        let d = shape[1];
+        assert_eq!(d, self.dim, "dimension mismatch: expected {}, got {}", self.dim, d);
+        assert_eq!(n, labels.len(), "vector count ({}) != label count ({})", n, labels.len());
+
+        for i in 0..n {
+            let row: Vec<f64> = (0..d).map(|j| vectors[[i, j]]).collect();
+            self.vectors.push(row);
+            self.labels.push(labels[i].clone());
+        }
+    }
+
+    /// 쿼리 벡터에 대해 top-k 검색
+    ///
+    /// 반환: Vec<(인덱스, 점수, 라벨)>
+    ///   - Cosine, DotProduct: 점수 내림차순 (높을수록 유사)
+    ///   - L2, L1: 점수 오름차순 (낮을수록 유사)
+    pub fn search(&self, query: &[f64], k: usize, metric: Metric) -> Vec<(usize, f64, String)> {
+        debug_assert_eq!(query.len(), self.dim, "query dimension mismatch");
+
+        if self.vectors.is_empty() {
+            return Vec::new();
+        }
+
+        // 1. 모든 벡터에 대해 점수 계산
+        let mut scores: Vec<(usize, f64)> = self.vectors.iter().enumerate().map(|(i, v)| {
+            let score = match metric {
+                Metric::Cosine => cosine_similarity_vec(query, v),
+                Metric::DotProduct => dot_product_vec(query, v),
+                Metric::L2 => l2_distance(query, v),
+                Metric::L1 => l1_distance(query, v),
+            };
+            (i, score)
+        }).collect();
+
+        // 2. 정렬: 유사도는 내림차순, 거리는 오름차순
+        match metric {
+            Metric::Cosine | Metric::DotProduct => {
+                scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            Metric::L2 | Metric::L1 => {
+                scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
+        // 3. top-k 반환
+        let k = k.min(scores.len());
+        scores[..k].iter().map(|&(i, score)| {
+            (i, score, self.labels[i].clone())
+        }).collect()
+    }
+
+    /// 배치 쿼리: 여러 쿼리를 한 번에 검색
+    pub fn batch_search(&self, queries: &ArrayD<f64>, k: usize, metric: Metric) -> Vec<Vec<(usize, f64, String)>> {
+        let shape = queries.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array");
+        let d = shape[1];
+        assert_eq!(d, self.dim, "dimension mismatch");
+
+        let q = shape[0];
+        (0..q).map(|i| {
+            let row: Vec<f64> = (0..d).map(|j| queries[[i, j]]).collect();
+            self.search(&row, k, metric)
+        }).collect()
+    }
+
+    /// 저장된 벡터 수
+    pub fn len(&self) -> usize {
+        self.vectors.len()
+    }
+
+    /// 인덱스가 비어있는지 확인
+    pub fn is_empty(&self) -> bool {
+        self.vectors.is_empty()
+    }
+
+    /// i번째 벡터 반환
+    pub fn get(&self, index: usize) -> &[f64] {
+        &self.vectors[index]
+    }
+
+    /// 임베딩 차원
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
