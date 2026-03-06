@@ -677,11 +677,24 @@ impl Function for SumFn {
         }
     }
     fn backward(&self, _xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
-        // 기울기를 원래 입력의 shape로 브로드캐스트
         let gy = &gys[0];
-        // 기울기의 shape를 입력 shape에 맞게 브로드캐스트 가능한 형태로 변환
         let gy_data = gy.data();
-        let broadcast = gy_data.broadcast(ndarray::IxDyn(&self.x_shape)).unwrap().to_owned();
+
+        // keepdims=false로 축이 제거된 경우, broadcast 전에 축을 다시 삽입
+        // 예: (B,T,D) → sum(axis=1) → (B,D) → backward → (B,1,D) → broadcast → (B,T,D)
+        let gy_for_broadcast = if let Some(axis) = self.axis {
+            if !self.keepdims {
+                let mut shape = gy_data.shape().to_vec();
+                shape.insert(axis, 1);
+                gy_data.to_owned().into_shape_with_order(ndarray::IxDyn(&shape)).unwrap()
+            } else {
+                gy_data.to_owned()
+            }
+        } else {
+            gy_data.to_owned()
+        };
+
+        let broadcast = gy_for_broadcast.broadcast(ndarray::IxDyn(&self.x_shape)).unwrap().to_owned();
         vec![Variable::new(broadcast)]
     }
     fn name(&self) -> &str { "Sum" }
@@ -2752,10 +2765,11 @@ impl BERT {
         }
     }
 
-    /// token_ids: (B, T), segment_ids: (B, T) → logits: (B, T, vocab_size)
-    pub fn forward(&self, token_ids: &Variable, segment_ids: &Variable) -> Variable {
+    /// token_ids: (B, T), segment_ids: (B, T) → hidden: (B, T, D)
+    /// MLM head 이전의 hidden states를 반환 (문장 임베딩 등에서 사용)
+    pub fn forward_hidden(&self, token_ids: &Variable, segment_ids: &Variable) -> Variable {
         let shape = token_ids.shape();
-        let (b, t) = (shape[0], shape[1]);
+        let t = shape[shape.len() - 1];
 
         // 토큰 임베딩: (B, T) → (B, T, D)
         let tok_emb = self.token_emb.forward(token_ids);
@@ -2780,11 +2794,18 @@ impl BERT {
             x = block.forward(&x);
         }
 
-        // 최종 LayerNorm
-        x = self.ln_f.forward(&x);
+        // 최종 LayerNorm → (B, T, D)
+        self.ln_f.forward(&x)
+    }
+
+    /// token_ids: (B, T), segment_ids: (B, T) → logits: (B, T, vocab_size)
+    pub fn forward(&self, token_ids: &Variable, segment_ids: &Variable) -> Variable {
+        let hidden = self.forward_hidden(token_ids, segment_ids); // (B, T, D)
+        let shape = hidden.shape();
+        let (b, t) = (shape[0], shape[1]);
 
         // MLM Head: (B, T, D) → (B*T, D) → (B*T, V) → (B, T, V)
-        let x_2d = reshape(&x, &[b * t, self.n_embd]);
+        let x_2d = reshape(&hidden, &[b * t, self.n_embd]);
         let logits = self.mlm_head.forward(&x_2d);
         reshape(&logits, &[b, t, self.vocab_size])
     }
@@ -3004,6 +3025,329 @@ impl Word2Vec {
     /// 학습된 단어 벡터 반환 (W_in의 가중치)
     pub fn get_word_vectors(&self) -> ArrayD<f64> {
         self.w_in.params()[0].data()
+    }
+}
+
+/// NT-Xent (Normalized Temperature-scaled Cross-Entropy) Loss
+///
+/// SimCLR/CLIP에서 사용하는 대칭 contrastive loss:
+///   1. L2 정규화: ẑ = z / ‖z‖
+///   2. 유사도 행렬: S_ij = ẑ_a_i · ẑ_b_j / τ
+///   3. 대칭 CE: L = ½[CE(S, diag) + CE(S^T, diag)]
+///
+/// 양의 쌍(대각선)은 가깝게, 나머지(배치 내 부정 쌍)는 멀리 밀어냄
+struct NTXentLossFn {
+    temperature: f64,
+    batch_size: usize,
+    embed_dim: usize,
+}
+
+impl Function for NTXentLossFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let z_a = &xs[0]; // (N, D)
+        let z_b = &xs[1]; // (N, D)
+        let n = self.batch_size;
+        let d = self.embed_dim;
+
+        // 1. L2 정규화 (행별)
+        let mut z_a_norm = ArrayD::zeros(z_a.raw_dim());
+        let mut z_b_norm = ArrayD::zeros(z_b.raw_dim());
+        for i in 0..n {
+            let mut norm_a = 0.0f64;
+            let mut norm_b = 0.0f64;
+            for j in 0..d {
+                norm_a += z_a[[i, j]] * z_a[[i, j]];
+                norm_b += z_b[[i, j]] * z_b[[i, j]];
+            }
+            norm_a = norm_a.sqrt().max(1e-12);
+            norm_b = norm_b.sqrt().max(1e-12);
+            for j in 0..d {
+                z_a_norm[[i, j]] = z_a[[i, j]] / norm_a;
+                z_b_norm[[i, j]] = z_b[[i, j]] / norm_b;
+            }
+        }
+
+        // 2. 유사도 행렬: S = ẑ_a @ ẑ_b^T / τ → (N, N)
+        let mut sim = ArrayD::zeros(ndarray::IxDyn(&[n, n]));
+        for i in 0..n {
+            for j in 0..n {
+                let mut dot = 0.0;
+                for k in 0..d {
+                    dot += z_a_norm[[i, k]] * z_b_norm[[j, k]];
+                }
+                sim[[i, j]] = dot / self.temperature;
+            }
+        }
+
+        // 3. 대칭 Cross-Entropy: target = diagonal (i→i)
+        //    L = ½[CE(S, diag) + CE(S^T, diag)]
+        let mut loss = 0.0;
+
+        // CE(S, diag): 각 행 i에서 target = i
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..n { max_val = max_val.max(sim[[i, j]]); }
+            let mut sum_exp = 0.0;
+            for j in 0..n { sum_exp += (sim[[i, j]] - max_val).exp(); }
+            let log_softmax_ii = sim[[i, i]] - max_val - sum_exp.ln();
+            loss -= log_softmax_ii;
+        }
+
+        // CE(S^T, diag): S 전치의 각 행 j에서 target = j
+        for j in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for i in 0..n { max_val = max_val.max(sim[[i, j]]); }
+            let mut sum_exp = 0.0;
+            for i in 0..n { sum_exp += (sim[[i, j]] - max_val).exp(); }
+            let log_softmax_jj = sim[[j, j]] - max_val - sum_exp.ln();
+            loss -= log_softmax_jj;
+        }
+
+        loss /= (2 * n) as f64;
+
+        vec![ndarray::arr0(loss).into_dyn()]
+    }
+
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let z_a_data = xs[0].data(); // (N, D)
+        let z_b_data = xs[1].data(); // (N, D)
+        let gy_val = gys[0].data().iter().next().copied().unwrap_or(1.0);
+        let n = self.batch_size;
+        let d = self.embed_dim;
+
+        // 1. L2 정규화
+        let mut z_a_hat = ArrayD::zeros(z_a_data.raw_dim());
+        let mut z_b_hat = ArrayD::zeros(z_b_data.raw_dim());
+        let mut norms_a = vec![0.0f64; n];
+        let mut norms_b = vec![0.0f64; n];
+        for i in 0..n {
+            for j in 0..d {
+                norms_a[i] += z_a_data[[i, j]] * z_a_data[[i, j]];
+                norms_b[i] += z_b_data[[i, j]] * z_b_data[[i, j]];
+            }
+            norms_a[i] = norms_a[i].sqrt().max(1e-12);
+            norms_b[i] = norms_b[i].sqrt().max(1e-12);
+            for j in 0..d {
+                z_a_hat[[i, j]] = z_a_data[[i, j]] / norms_a[i];
+                z_b_hat[[i, j]] = z_b_data[[i, j]] / norms_b[i];
+            }
+        }
+
+        // 2. 유사도 행렬 S = ẑ_a @ ẑ_b^T / τ
+        let mut sim = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut dot = 0.0;
+                for k in 0..d { dot += z_a_hat[[i, k]] * z_b_hat[[j, k]]; }
+                sim[i][j] = dot / self.temperature;
+            }
+        }
+
+        // 3. dL/dS 계산
+        //    dL/dS = ½[(softmax_row(S) - I)/N + ((softmax_col(S) - I)/N)^T]
+        let mut ds = vec![vec![0.0f64; n]; n];
+
+        // softmax(S) 행별 — CE(S, diag) 기울기
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..n { max_val = max_val.max(sim[i][j]); }
+            let mut sum_exp = 0.0;
+            let mut exps = vec![0.0; n];
+            for j in 0..n {
+                exps[j] = (sim[i][j] - max_val).exp();
+                sum_exp += exps[j];
+            }
+            for j in 0..n {
+                let softmax_ij = exps[j] / sum_exp;
+                let target = if i == j { 1.0 } else { 0.0 };
+                ds[i][j] += 0.5 * (softmax_ij - target) / n as f64;
+            }
+        }
+
+        // softmax(S^T) 열별 — CE(S^T, diag) 기울기
+        for j in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for i in 0..n { max_val = max_val.max(sim[i][j]); }
+            let mut sum_exp = 0.0;
+            let mut exps = vec![0.0; n];
+            for i in 0..n {
+                exps[i] = (sim[i][j] - max_val).exp();
+                sum_exp += exps[i];
+            }
+            for i in 0..n {
+                let softmax_ji = exps[i] / sum_exp;
+                let target = if i == j { 1.0 } else { 0.0 };
+                // S^T의 행 j, 열 i → S의 행 i, 열 j (전치)
+                ds[i][j] += 0.5 * (softmax_ji - target) / n as f64;
+            }
+        }
+
+        // 4. dL/dẑ_a = dS · ẑ_b / τ, dL/dẑ_b = dS^T · ẑ_a / τ
+        let mut g_a_hat: ArrayD<f64> = ArrayD::zeros(z_a_data.raw_dim());
+        let mut g_b_hat: ArrayD<f64> = ArrayD::zeros(z_b_data.raw_dim());
+        for i in 0..n {
+            for j in 0..n {
+                let ds_ij = ds[i][j] / self.temperature;
+                for k in 0..d {
+                    g_a_hat[[i, k]] += ds_ij * z_b_hat[[j, k]];
+                    g_b_hat[[j, k]] += ds_ij * z_a_hat[[i, k]];
+                }
+            }
+        }
+
+        // 5. L2 norm 역전파: dL/dz = (g - ẑ(g·ẑ)) / ‖z‖
+        let mut g_a = ArrayD::zeros(z_a_data.raw_dim());
+        let mut g_b = ArrayD::zeros(z_b_data.raw_dim());
+        for i in 0..n {
+            let mut dot_a = 0.0;
+            let mut dot_b = 0.0;
+            for k in 0..d {
+                dot_a += g_a_hat[[i, k]] * z_a_hat[[i, k]];
+                dot_b += g_b_hat[[i, k]] * z_b_hat[[i, k]];
+            }
+            for k in 0..d {
+                g_a[[i, k]] = (g_a_hat[[i, k]] - z_a_hat[[i, k]] * dot_a) / norms_a[i] * gy_val;
+                g_b[[i, k]] = (g_b_hat[[i, k]] - z_b_hat[[i, k]] * dot_b) / norms_b[i] * gy_val;
+            }
+        }
+
+        vec![Variable::new(g_a), Variable::new(g_b)]
+    }
+
+    fn name(&self) -> &str { "NTXentLoss" }
+}
+
+/// NT-Xent (InfoNCE) Loss: 대칭 contrastive loss
+///
+/// z_a: (N, D) — 앵커 임베딩
+/// z_b: (N, D) — 양의 쌍 임베딩
+/// temperature: τ (보통 0.05~0.5, 작을수록 hard negative에 집중)
+///
+/// L = ½[CE(cos(z_a, z_b)/τ, diag) + CE(cos(z_a, z_b)^T/τ, diag)]
+pub fn nt_xent_loss(z_a: &Variable, z_b: &Variable, temperature: f64) -> Variable {
+    let batch_size = z_a.shape()[0];
+    let embed_dim = z_a.shape()[1];
+    Func::new(NTXentLossFn {
+        temperature,
+        batch_size,
+        embed_dim,
+    }).call(&[z_a, z_b])
+}
+
+/// Sentence Embedding: BERT 인코더 + Mean Pooling + Projection
+///
+/// SBERT (Reimers & Gurevych, 2019)에서 영감:
+/// 1. BERT 인코더로 토큰별 hidden states 생성 (B, T, D)
+/// 2. Mean Pooling으로 문장 벡터 추출 (B, D)
+/// 3. Projection head로 contrastive 학습 공간에 매핑 (B, P)
+///
+/// 학습: NT-Xent loss로 유사 문장 쌍은 가깝게, 다른 문장은 멀리
+/// 추론: projection 전 hidden (encode)을 문장 벡터로 사용
+pub struct SentenceEmbedding {
+    token_emb: Embedding,
+    pos_emb: Embedding,
+    segment_emb: Embedding,
+    blocks: Vec<TransformerBlock>,
+    ln_f: LayerNorm,
+    projection: Linear,
+    n_embd: usize,
+    proj_dim: usize,
+}
+
+impl SentenceEmbedding {
+    pub fn new(
+        vocab_size: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_layer: usize,
+        max_seq_len: usize,
+        proj_dim: usize,
+        dropout: f64,
+        seed: u64,
+    ) -> Self {
+        let mut blocks = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            blocks.push(TransformerBlock::new_with_causal(
+                n_embd, n_head, dropout,
+                seed.wrapping_add(1000 * (i as u64 + 1)),
+                false, // 양방향 어텐션
+            ));
+        }
+        SentenceEmbedding {
+            token_emb: Embedding::new(vocab_size, n_embd, seed),
+            pos_emb: Embedding::new(max_seq_len, n_embd, seed.wrapping_add(1)),
+            segment_emb: Embedding::new(2, n_embd, seed.wrapping_add(2)),
+            blocks,
+            ln_f: LayerNorm::new(n_embd),
+            projection: Linear::new(proj_dim, seed.wrapping_add(3)),
+            n_embd,
+            proj_dim,
+        }
+    }
+
+    /// token_ids: (B, T), segment_ids: (B, T) → (B, proj_dim)
+    /// 학습용: projection head 포함
+    pub fn forward(&self, token_ids: &Variable, segment_ids: &Variable) -> Variable {
+        let hidden = self.encode(token_ids, segment_ids); // (B, D)
+        let b = hidden.shape()[0];
+        let h2d = reshape(&hidden, &[b, self.n_embd]);
+        self.projection.forward(&h2d) // (B, proj_dim)
+    }
+
+    /// token_ids: (B, T), segment_ids: (B, T) → (B, D)
+    /// 추론용: mean pooling 후 projection 전의 hidden states
+    pub fn encode(&self, token_ids: &Variable, segment_ids: &Variable) -> Variable {
+        let shape = token_ids.shape();
+        let t = shape[shape.len() - 1];
+
+        // 3개 임베딩 합산
+        let tok_emb = self.token_emb.forward(token_ids);
+        let pos_idx = Variable::new(
+            ArrayD::from_shape_vec(
+                ndarray::IxDyn(&[t]),
+                (0..t).map(|i| i as f64).collect(),
+            ).unwrap()
+        );
+        let pos_emb = self.pos_emb.forward(&pos_idx);
+        let seg_emb = self.segment_emb.forward(segment_ids);
+        let mut x = &(&tok_emb + &pos_emb) + &seg_emb; // (B, T, D)
+
+        // Transformer 블록
+        for block in &self.blocks {
+            x = block.forward(&x);
+        }
+
+        // LayerNorm → (B, T, D)
+        x = self.ln_f.forward(&x);
+
+        // Mean Pooling: (B, T, D) → sum over T → (B, D) → / T
+        let summed = sum_with(&x, Some(1), false); // (B, D)
+        let t_inv = Variable::new(ndarray::arr0(1.0 / t as f64).into_dyn());
+        &summed * &t_inv
+    }
+
+    pub fn cleargrads(&self) {
+        self.token_emb.cleargrads();
+        self.pos_emb.cleargrads();
+        self.segment_emb.cleargrads();
+        for block in &self.blocks {
+            block.cleargrads();
+        }
+        self.ln_f.cleargrads();
+        self.projection.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.token_emb.params());
+        p.extend(self.pos_emb.params());
+        p.extend(self.segment_emb.params());
+        for block in &self.blocks {
+            p.extend(block.params());
+        }
+        p.extend(self.ln_f.params());
+        p.extend(self.projection.params());
+        p
     }
 }
 
