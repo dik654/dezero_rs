@@ -2814,6 +2814,199 @@ impl BERT {
     }
 }
 
+/// Negative Sampling Loss: Skip-gram의 효율적 손실 함수
+///
+/// 전체 어휘에 softmax 대신, 정답 1개 + 부정 K개만으로 이진 분류:
+///   L = -log σ(u_pos · v) - Σ_k log σ(-u_neg_k · v)
+///
+/// 입력: v_center (N, D), u_all (N*(1+K), D)
+/// labels: [+1, -1, -1, ..., -1] per sample (1+K 반복 N번)
+///
+/// Gradient: d/d(dot) = (σ(dot) - label_01) / N
+///   정답(label_01=1): σ(dot) - 1 → 확률이 높을수록 gradient 작음
+///   부정(label_01=0): σ(dot) → 확률이 낮을수록 gradient 작음
+struct NegativeSamplingLossFn {
+    labels: Vec<f64>,       // +1.0 (정답) 또는 -1.0 (부정)
+    num_negative: usize,    // K
+    batch_size: usize,      // N
+    embed_dim: usize,       // D
+}
+
+impl Function for NegativeSamplingLossFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        let v = &xs[0];  // (N, D) — 중심 단어 임베딩
+        let u = &xs[1];  // (N*(1+K), D) — 정답+부정 단어 임베딩
+
+        let n = self.batch_size;
+        let k1 = 1 + self.num_negative;
+        let d = self.embed_dim;
+
+        let mut loss = 0.0;
+        for i in 0..n {
+            for j in 0..k1 {
+                let idx = i * k1 + j;
+                let mut dot = 0.0;
+                for dd in 0..d {
+                    dot += v[[i, dd]] * u[[idx, dd]];
+                }
+                // log_sigmoid(label * dot) — 수치 안정 버전
+                // log σ(x) = min(0, x) - log(1 + exp(-|x|))
+                let x = self.labels[idx] * dot;
+                let log_sig = x.min(0.0) - (1.0 + (-x.abs()).exp()).ln();
+                loss -= log_sig;
+            }
+        }
+        loss /= n as f64;
+
+        vec![ndarray::arr0(loss).into_dyn()]
+    }
+
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let v_data = xs[0].data();  // (N, D)
+        let u_data = xs[1].data();  // (N*(1+K), D)
+        let gy_val = gys[0].data().iter().next().copied().unwrap_or(1.0);
+
+        let n = self.batch_size;
+        let k1 = 1 + self.num_negative;
+        let d = self.embed_dim;
+
+        let mut gv = ArrayD::zeros(v_data.raw_dim());
+        let mut gu = ArrayD::zeros(u_data.raw_dim());
+
+        for i in 0..n {
+            for j in 0..k1 {
+                let idx = i * k1 + j;
+                let mut dot = 0.0;
+                for dd in 0..d {
+                    dot += v_data[[i, dd]] * u_data[[idx, dd]];
+                }
+                let sig = 1.0 / (1.0 + (-dot).exp());
+                let label_01 = if self.labels[idx] > 0.0 { 1.0 } else { 0.0 };
+                let grad_dot = (sig - label_01) / n as f64 * gy_val;
+
+                for dd in 0..d {
+                    gv[[i, dd]] += grad_dot * u_data[[idx, dd]];
+                    gu[[idx, dd]] += grad_dot * v_data[[i, dd]];
+                }
+            }
+        }
+
+        vec![Variable::new(gv), Variable::new(gu)]
+    }
+
+    fn name(&self) -> &str { "NegativeSamplingLoss" }
+}
+
+/// Negative Sampling Loss 함수
+///
+/// v_center: (N, D) 중심 단어 임베딩
+/// u_all: (N*(1+K), D) 정답+부정 단어 임베딩
+/// labels: +1.0(정답) / -1.0(부정), 길이 N*(1+K)
+/// num_negative: K
+pub fn negative_sampling_loss(
+    v_center: &Variable,
+    u_all: &Variable,
+    labels: &[f64],
+    num_negative: usize,
+) -> Variable {
+    let batch_size = v_center.shape()[0];
+    let embed_dim = v_center.shape()[1];
+    Func::new(NegativeSamplingLossFn {
+        labels: labels.to_vec(),
+        num_negative,
+        batch_size,
+        embed_dim,
+    }).call(&[v_center, u_all])
+}
+
+/// Word2Vec: Skip-gram + Negative Sampling 모델
+///
+/// 두 개의 Embedding 레이어:
+///   W_in: 중심 단어 임베딩 (학습 후 단어 벡터로 사용)
+///   W_out: 문맥 단어 임베딩 (학습 보조, 보통 버림)
+///
+/// 학습: center_word로 context_word를 예측하되,
+/// K개의 부정 샘플과 구분하는 이진 분류로 효율화
+pub struct Word2Vec {
+    w_in: Embedding,
+    w_out: Embedding,
+    vocab_size: usize,
+    embed_dim: usize,
+}
+
+impl Word2Vec {
+    pub fn new(vocab_size: usize, embed_dim: usize, seed: u64) -> Self {
+        Word2Vec {
+            w_in: Embedding::new(vocab_size, embed_dim, seed),
+            w_out: Embedding::new(vocab_size, embed_dim, seed.wrapping_add(1)),
+            vocab_size,
+            embed_dim,
+        }
+    }
+
+    /// Skip-gram forward
+    /// center_ids: (N,) 중심 단어 인덱스
+    /// context_ids: (N,) 정답 문맥 단어 인덱스
+    /// negative_ids: (N, K) 부정 샘플 인덱스
+    /// 반환: 스칼라 loss
+    pub fn forward(
+        &self,
+        center_ids: &Variable,
+        context_ids: &Variable,
+        negative_ids: &Variable,
+    ) -> Variable {
+        let n = center_ids.shape()[0];
+        let k = if negative_ids.shape().len() == 2 {
+            negative_ids.shape()[1]
+        } else {
+            negative_ids.shape()[0] / n
+        };
+
+        // 중심 단어 임베딩: (N,) → (N, D)
+        let v_center = self.w_in.forward(center_ids);
+
+        // 정답 + 부정 단어 인덱스를 하나로 합침: (N*(1+K),)
+        let ctx_data = context_ids.data();
+        let neg_data = negative_ids.data();
+        let mut all_ids_data = Vec::with_capacity(n * (1 + k));
+        for i in 0..n {
+            all_ids_data.push(ctx_data[i]);
+            for j in 0..k {
+                all_ids_data.push(neg_data[[i, j]]);
+            }
+        }
+        let all_ids = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[n * (1 + k)]), all_ids_data).unwrap()
+        );
+
+        // 모든 타겟 임베딩: (N*(1+K),) → (N*(1+K), D)
+        let u_all = self.w_out.forward(&all_ids);
+
+        // 라벨: [+1, -1, -1, ..., -1] per sample
+        let labels: Vec<f64> = (0..n).flat_map(|_| {
+            std::iter::once(1.0).chain(std::iter::repeat_n(-1.0, k))
+        }).collect();
+
+        negative_sampling_loss(&v_center, &u_all, &labels, k)
+    }
+
+    pub fn cleargrads(&self) {
+        self.w_in.cleargrads();
+        self.w_out.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = self.w_in.params();
+        p.extend(self.w_out.params());
+        p
+    }
+
+    /// 학습된 단어 벡터 반환 (W_in의 가중치)
+    pub fn get_word_vectors(&self) -> ArrayD<f64> {
+        self.w_in.params()[0].data()
+    }
+}
+
 /// Model 트레잇: 여러 레이어를 하나의 모델로 묶어서 관리
 /// step44에서는 l1.cleargrads(), l2.cleargrads()를 각각 호출했지만,
 /// Model로 묶으면 model.cleargrads() 한 번으로 모든 레이어의 기울기를 초기화
