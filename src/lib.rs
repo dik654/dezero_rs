@@ -5175,6 +5175,160 @@ impl HNSWIndex {
     pub fn entry_point(&self) -> Option<usize> { self.entry_point }
 }
 
+// --- VAE (Variational Autoencoder) ---
+
+/// VAE 손실: Reconstruction Loss + beta * KL Divergence
+///
+/// ELBO (Evidence Lower Bound) 최대화를 최소화 문제로 변환:
+///   L = MSE(x, x_recon) + beta * D_KL(q(z|x) || p(z))
+///
+/// KL (가우시안 closed-form):
+///   D_KL = -0.5 * sum(1 + log_var - mu² - exp(log_var)) / batch_size
+///
+/// beta > 1: disentangled 표현 학습 유도 (beta-VAE)
+///
+/// 반환: (total_loss, recon_loss, kl_loss)
+pub fn vae_loss(
+    x: &Variable,
+    x_recon: &Variable,
+    mu: &Variable,
+    log_var: &Variable,
+    beta: f64,
+) -> (Variable, Variable, Variable) {
+    let recon_loss = mean_squared_error(x, x_recon);
+
+    let batch_size = mu.shape()[0] as f64;
+    // KL = -0.5 * sum(1 + log_var - mu^2 - exp(log_var)) / batch_size
+    let kl_elem = &(&(log_var + 1.0) - &mu.pow(2.0)) - &exp(log_var);
+    let kl_loss = &sum(&kl_elem) * (-0.5 / batch_size);
+
+    let total_loss = &recon_loss + &(&kl_loss * beta);
+    (total_loss, recon_loss, kl_loss)
+}
+
+/// VAE (Variational Autoencoder) — 생성모델
+///
+/// Encoder: x → h → (mu, log_var)
+/// Reparameterization: z = mu + exp(0.5 * log_var) * eps, eps ~ N(0,1)
+/// Decoder: z → h → x_recon
+///
+/// 학습 목표: ELBO 최대화 = Reconstruction + KL Divergence 최소화
+pub struct VAE {
+    encoder_h: Linear,
+    mu_layer: Linear,
+    log_var_layer: Linear,
+    decoder_h: Linear,
+    decoder_out: Linear,
+    pub latent_dim: usize,
+    pub beta: f64,
+    rng_state: Cell<u64>,
+}
+
+impl VAE {
+    /// VAE 생성
+    /// - input_dim: 입력 차원 (MNIST: 784)
+    /// - hidden_dim: 은닉층 차원 (권장: 256~512)
+    /// - latent_dim: 잠재 공간 차원 (권장: 2~32)
+    /// - beta: KL 가중치 (1.0=표준 VAE, >1=beta-VAE)
+    /// - seed: PRNG 시드
+    pub fn new(input_dim: usize, hidden_dim: usize, latent_dim: usize, beta: f64, seed: u64) -> Self {
+        let _ = input_dim; // Linear의 lazy init이 처리
+        VAE {
+            encoder_h: Linear::new(hidden_dim, seed),
+            mu_layer: Linear::new(latent_dim, seed.wrapping_add(1)),
+            log_var_layer: Linear::new(latent_dim, seed.wrapping_add(2)),
+            decoder_h: Linear::new(hidden_dim, seed.wrapping_add(3)),
+            decoder_out: Linear::new(input_dim, seed.wrapping_add(4)),
+            latent_dim,
+            beta,
+            rng_state: Cell::new(seed.wrapping_add(5)),
+        }
+    }
+
+    fn next_f64(&self) -> f64 {
+        let state = self.rng_state.get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state.set(state);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_normal(&self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Encoder: x → sigmoid(h) → (mu, log_var)
+    pub fn encode(&self, x: &Variable) -> (Variable, Variable) {
+        let h = sigmoid(&self.encoder_h.forward(x));
+        let mu = self.mu_layer.forward(&h);
+        let log_var = self.log_var_layer.forward(&h);
+        (mu, log_var)
+    }
+
+    /// Reparameterization trick: z = mu + exp(0.5 * log_var) * eps
+    /// eps ~ N(0,1)은 leaf Variable → backward에서 gradient 차단
+    pub fn reparameterize(&self, mu: &Variable, log_var: &Variable) -> Variable {
+        let shape = mu.shape();
+        let n: usize = shape.iter().product();
+        let eps_data: Vec<f64> = (0..n).map(|_| self.next_normal()).collect();
+        let eps = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&shape), eps_data).unwrap(),
+        );
+        // z = mu + exp(0.5 * log_var) * eps
+        mu + &(&exp(&(log_var * 0.5)) * &eps)
+    }
+
+    /// Decoder: z → sigmoid(h) → sigmoid(output)
+    pub fn decode(&self, z: &Variable) -> Variable {
+        let h = sigmoid(&self.decoder_h.forward(z));
+        sigmoid(&self.decoder_out.forward(&h))
+    }
+
+    /// Forward: encode → reparameterize → decode
+    /// 반환: (x_recon, mu, log_var)
+    pub fn forward(&self, x: &Variable) -> (Variable, Variable, Variable) {
+        let (mu, log_var) = self.encode(x);
+        let z = self.reparameterize(&mu, &log_var);
+        let x_recon = self.decode(&z);
+        (x_recon, mu, log_var)
+    }
+
+    /// 잠재 공간에서 샘플링 → 디코더로 생성
+    pub fn sample(&self, num_samples: usize) -> Variable {
+        let z_data: Vec<f64> = (0..num_samples * self.latent_dim)
+            .map(|_| self.next_normal())
+            .collect();
+        let z = Variable::new(
+            ArrayD::from_shape_vec(
+                ndarray::IxDyn(&[num_samples, self.latent_dim]),
+                z_data,
+            )
+            .unwrap(),
+        );
+        self.decode(&z)
+    }
+
+    pub fn cleargrads(&self) {
+        self.encoder_h.cleargrads();
+        self.mu_layer.cleargrads();
+        self.log_var_layer.cleargrads();
+        self.decoder_h.cleargrads();
+        self.decoder_out.cleargrads();
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.encoder_h.params());
+        p.extend(self.mu_layer.params());
+        p.extend(self.log_var_layer.params());
+        p.extend(self.decoder_h.params());
+        p.extend(self.decoder_out.params());
+        p
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
