@@ -4351,6 +4351,239 @@ impl BruteForceIndex {
     }
 }
 
+/// K-means 클러스터링 (Lloyd's 알고리즘)
+///
+/// 벡터 집합을 K개 클러스터로 분할. L2 거리 기반 할당 → 중심 갱신 반복.
+/// IVF의 coarse quantizer로 사용: 공간을 K개 Voronoi cell로 분할.
+///
+/// 반환: (centroids [K][D], assignments [N])
+pub fn kmeans(
+    vectors: &[&[f64]],
+    k: usize,
+    max_iter: usize,
+    seed: u64,
+) -> (Vec<Vec<f64>>, Vec<usize>) {
+    let n = vectors.len();
+    assert!(n >= k, "kmeans: need at least k={} vectors, got {}", k, n);
+    let dim = vectors[0].len();
+
+    // 1. Fisher-Yates로 k개의 고유 초기 중심 선택
+    let mut rng = seed;
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in 0..k {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = i + ((rng >> 11) as usize % (n - i));
+        indices.swap(i, j);
+    }
+    let mut centroids: Vec<Vec<f64>> = (0..k).map(|i| vectors[indices[i]].to_vec()).collect();
+    let mut assignments = vec![0usize; n];
+
+    // 2. Lloyd's: assign → update → repeat
+    for _ in 0..max_iter {
+        // Assign
+        let mut changed = false;
+        for i in 0..n {
+            let mut best_c = 0;
+            let mut best_dist = f64::MAX;
+            for c in 0..k {
+                let dist = l2_distance(vectors[i], &centroids[c]);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_c = c;
+                }
+            }
+            if assignments[i] != best_c {
+                assignments[i] = best_c;
+                changed = true;
+            }
+        }
+        if !changed { break; }
+
+        // Update
+        let mut new_centroids = vec![vec![0.0; dim]; k];
+        let mut counts = vec![0usize; k];
+        for i in 0..n {
+            let c = assignments[i];
+            counts[c] += 1;
+            for d in 0..dim {
+                new_centroids[c][d] += vectors[i][d];
+            }
+        }
+        for c in 0..k {
+            if counts[c] > 0 {
+                for d in 0..dim {
+                    new_centroids[c][d] /= counts[c] as f64;
+                }
+            } else {
+                new_centroids[c] = centroids[c].clone();
+            }
+        }
+        centroids = new_centroids;
+    }
+
+    (centroids, assignments)
+}
+
+/// IVF (Inverted File Index) 근사 벡터 검색
+///
+/// 공간을 K개 클러스터(Voronoi cell)로 분할하고, 각 클러스터에 속한 벡터의
+/// 역인덱스를 구축. 쿼리 시 nprobe개 가장 가까운 클러스터만 탐색.
+/// O(N·D) → O(nprobe·N/K·D). nprobe=K이면 brute force와 동일.
+pub struct IVFIndex {
+    vectors: Vec<Vec<f64>>,
+    labels: Vec<String>,
+    dim: usize,
+    n_clusters: usize,
+    centroids: Vec<Vec<f64>>,
+    inverted_lists: Vec<Vec<usize>>,
+    is_trained: bool,
+}
+
+impl IVFIndex {
+    /// 빈 IVF 인덱스 생성. 사용 전 train() 필요.
+    pub fn new(dim: usize, n_clusters: usize) -> Self {
+        IVFIndex {
+            vectors: Vec::new(),
+            labels: Vec::new(),
+            dim,
+            n_clusters,
+            centroids: Vec::new(),
+            inverted_lists: Vec::new(),
+            is_trained: false,
+        }
+    }
+
+    /// K-means로 클러스터 중심 학습
+    pub fn train(&mut self, vectors: &[&[f64]], max_iter: usize, seed: u64) {
+        assert!(!vectors.is_empty(), "train: need at least 1 vector");
+        assert!(vectors.len() >= self.n_clusters,
+            "train: need at least n_clusters={} vectors, got {}", self.n_clusters, vectors.len());
+
+        let (centroids, _) = kmeans(vectors, self.n_clusters, max_iter, seed);
+        self.centroids = centroids;
+        self.inverted_lists = vec![Vec::new(); self.n_clusters];
+        self.is_trained = true;
+    }
+
+    /// 단일 벡터 추가: 가장 가까운 중심의 역인덱스에 등록
+    pub fn add(&mut self, vector: &[f64], label: &str) {
+        assert!(self.is_trained, "IVFIndex: must call train() before add()");
+        debug_assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
+
+        let idx = self.vectors.len();
+        self.vectors.push(vector.to_vec());
+        self.labels.push(label.to_string());
+
+        let cluster = self.nearest_centroid(vector);
+        self.inverted_lists[cluster].push(idx);
+    }
+
+    /// 배치 벡터 추가
+    pub fn add_batch(&mut self, vectors: &ArrayD<f64>, labels: &[String]) {
+        assert!(self.is_trained, "IVFIndex: must call train() before add_batch()");
+        let shape = vectors.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array, got {}D", shape.len());
+        let n = shape[0];
+        let d = shape[1];
+        assert_eq!(d, self.dim, "dimension mismatch");
+        assert_eq!(n, labels.len(), "vector count != label count");
+
+        for i in 0..n {
+            let row: Vec<f64> = (0..d).map(|j| vectors[[i, j]]).collect();
+            self.add(&row, &labels[i]);
+        }
+    }
+
+    /// 근사 최근접 탐색
+    ///
+    /// coarse search: nprobe개 가까운 centroid 찾기 (L2)
+    /// fine search: 해당 클러스터 벡터만 user metric으로 정밀 검색
+    pub fn search(&self, query: &[f64], k: usize, nprobe: usize, metric: Metric) -> Vec<(usize, f64, String)> {
+        assert!(self.is_trained, "IVFIndex: must call train() before search()");
+        debug_assert_eq!(query.len(), self.dim, "query dimension mismatch");
+
+        if self.vectors.is_empty() {
+            return Vec::new();
+        }
+
+        let nprobe = nprobe.min(self.n_clusters);
+
+        // 1. Coarse: nprobe개 가장 가까운 중심 (L2)
+        let mut centroid_dists: Vec<(usize, f64)> = self.centroids.iter().enumerate()
+            .map(|(i, c)| (i, l2_distance(query, c)))
+            .collect();
+        centroid_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 2. 후보 수집
+        let mut candidates: Vec<usize> = Vec::new();
+        for &(cluster_id, _) in centroid_dists.iter().take(nprobe) {
+            candidates.extend_from_slice(&self.inverted_lists[cluster_id]);
+        }
+
+        // 3. Fine search
+        let mut scores: Vec<(usize, f64)> = candidates.iter().map(|&i| {
+            let score = match metric {
+                Metric::Cosine => cosine_similarity_vec(query, &self.vectors[i]),
+                Metric::DotProduct => dot_product_vec(query, &self.vectors[i]),
+                Metric::L2 => l2_distance(query, &self.vectors[i]),
+                Metric::L1 => l1_distance(query, &self.vectors[i]),
+            };
+            (i, score)
+        }).collect();
+
+        // 4. 정렬
+        match metric {
+            Metric::Cosine | Metric::DotProduct => {
+                scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            Metric::L2 | Metric::L1 => {
+                scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
+        let k = k.min(scores.len());
+        scores[..k].iter().map(|&(i, score)| {
+            (i, score, self.labels[i].clone())
+        }).collect()
+    }
+
+    /// 배치 쿼리
+    pub fn batch_search(&self, queries: &ArrayD<f64>, k: usize, nprobe: usize, metric: Metric) -> Vec<Vec<(usize, f64, String)>> {
+        let shape = queries.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array");
+        assert_eq!(shape[1], self.dim, "dimension mismatch");
+
+        let q = shape[0];
+        (0..q).map(|i| {
+            let row: Vec<f64> = (0..shape[1]).map(|j| queries[[i, j]]).collect();
+            self.search(&row, k, nprobe, metric)
+        }).collect()
+    }
+
+    pub fn len(&self) -> usize { self.vectors.len() }
+    pub fn is_empty(&self) -> bool { self.vectors.is_empty() }
+    pub fn dim(&self) -> usize { self.dim }
+    pub fn is_trained(&self) -> bool { self.is_trained }
+
+    /// 각 클러스터의 벡터 수 (디버깅용)
+    pub fn cluster_sizes(&self) -> Vec<usize> {
+        self.inverted_lists.iter().map(|list| list.len()).collect()
+    }
+
+    fn nearest_centroid(&self, vector: &[f64]) -> usize {
+        let mut best = 0;
+        let mut best_dist = f64::MAX;
+        for (i, c) in self.centroids.iter().enumerate() {
+            let dist = l2_distance(vector, c);
+            if dist < best_dist {
+                best_dist = dist;
+                best = i;
+            }
+        }
+        best
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
