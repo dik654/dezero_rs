@@ -4,7 +4,7 @@
 
 use ndarray::ArrayD;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::io::Read;
 use std::rc::{Rc, Weak};
@@ -4803,6 +4803,376 @@ impl PQIndex {
         let ratio = if original > 0 { compressed as f64 / original as f64 } else { 0.0 };
         (original, compressed, ratio)
     }
+}
+
+// --- HNSW (Hierarchical Navigable Small World) ---
+
+/// f64 순서 래퍼 (BinaryHeap에서 Ord 필요) — NaN은 Equal 처리
+#[derive(Clone, Copy, PartialEq)]
+struct FloatOrd(f64);
+
+impl Eq for FloatOrd {}
+
+impl PartialOrd for FloatOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FloatOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// HNSW (Hierarchical Navigable Small World) 근사 벡터 검색 인덱스
+///
+/// 다층 네비게이블 스몰월드 그래프 기반 ANN. IVF/PQ와 달리 train() 불필요 —
+/// 벡터를 하나씩 add()하면 그래프가 점진적으로 성장.
+///
+/// 구조:
+///   - Layer 0: 모든 벡터 포함 (밀집 그래프, M_max0 = 2*M 연결)
+///   - Layer 1+: 지수적으로 감소하는 노드 (희소 그래프, M 연결)
+///   - 검색: 최상위 레이어에서 entry point부터 greedy → layer 0에서 ef 빔서치
+///
+/// 파라미터:
+///   - M: 각 레이어의 최대 이웃 수 (layer 0 제외)
+///   - M_max0: layer 0의 최대 이웃 수 (= 2*M)
+///   - ef_construction: 삽입 시 후보 집합 크기 (클수록 그래프 품질↑, 속도↓)
+///   - mL: 레이어 할당 확률 계수 (= 1/ln(M))
+pub struct HNSWIndex {
+    vectors: Vec<Vec<f64>>,
+    labels: Vec<String>,
+    dim: usize,
+    /// neighbors[node_id][layer] = Vec<neighbor_id>
+    neighbors: Vec<Vec<Vec<usize>>>,
+    node_levels: Vec<usize>,
+    entry_point: Option<usize>,
+    max_level: usize,
+    m: usize,
+    m_max0: usize,
+    ef_construction: usize,
+    ml: f64,
+    rng_state: u64,
+}
+
+impl HNSWIndex {
+    /// HNSW 인덱스 생성
+    ///
+    /// - dim: 벡터 차원
+    /// - m: 레이어당 최대 이웃 수 (권장: 12~48). M_max0 = 2*M 자동 설정.
+    /// - ef_construction: 삽입 시 후보 크기 (권장: 100~200). 클수록 정확↑ 속도↓.
+    /// - seed: PRNG 시드 (레이어 할당 재현성)
+    pub fn new(dim: usize, m: usize, ef_construction: usize, seed: u64) -> Self {
+        assert!(dim > 0, "HNSWIndex: dim must be > 0");
+        assert!(m > 0, "HNSWIndex: m must be > 0");
+        assert!(ef_construction > 0, "HNSWIndex: ef_construction must be > 0");
+        HNSWIndex {
+            vectors: Vec::new(),
+            labels: Vec::new(),
+            dim,
+            neighbors: Vec::new(),
+            node_levels: Vec::new(),
+            entry_point: None,
+            max_level: 0,
+            m,
+            m_max0: 2 * m,
+            ef_construction,
+            ml: 1.0 / (m as f64).ln(),
+            rng_state: seed,
+        }
+    }
+
+    /// LCG PRNG → 레이어 할당: l = floor(-ln(u) * mL), 최대 16
+    fn random_level(&mut self) -> usize {
+        self.rng_state = self.rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = (self.rng_state >> 11) as f64 / (1u64 << 53) as f64;
+        let u = u.max(1e-15);
+        let level = (-u.ln() * self.ml).floor() as usize;
+        level.min(16)
+    }
+
+    /// 내부 거리: 항상 "작을수록 가까움"으로 정규화
+    /// Cosine/DotProduct는 부호 반전하여 min-heap 호환
+    fn distance_internal(&self, a: &[f64], b: &[f64], metric: Metric) -> f64 {
+        match metric {
+            Metric::L2 => l2_distance(a, b),
+            Metric::L1 => l1_distance(a, b),
+            Metric::Cosine => -cosine_similarity_vec(a, b),
+            Metric::DotProduct => -dot_product_vec(a, b),
+        }
+    }
+
+    /// 단일 레이어 빔서치 (HNSW 핵심)
+    ///
+    /// entry_points에서 시작, ef개 최근접 이웃 탐색.
+    /// 반환: Vec<(distance, node_id)> — distance 오름차순 (내부 정규화 기준)
+    fn search_layer(
+        &self,
+        query: &[f64],
+        entry_points: &[usize],
+        ef: usize,
+        layer: usize,
+        metric: Metric,
+    ) -> Vec<(f64, usize)> {
+        use std::cmp::Reverse;
+
+        let mut visited = HashSet::new();
+        // candidates: min-heap (가장 가까운 것이 top)
+        let mut candidates: BinaryHeap<Reverse<(FloatOrd, usize)>> = BinaryHeap::new();
+        // results: max-heap (가장 먼 것이 top — ef 초과 시 제거용)
+        let mut results: BinaryHeap<(FloatOrd, usize)> = BinaryHeap::new();
+
+        for &ep in entry_points {
+            if visited.insert(ep) {
+                let dist = self.distance_internal(query, &self.vectors[ep], metric);
+                candidates.push(Reverse((FloatOrd(dist), ep)));
+                results.push((FloatOrd(dist), ep));
+            }
+        }
+
+        while let Some(Reverse((FloatOrd(c_dist), c_id))) = candidates.pop() {
+            let f_dist = results.peek().map(|&(FloatOrd(d), _)| d).unwrap_or(f64::MAX);
+            if c_dist > f_dist {
+                break;
+            }
+
+            // 이 노드가 해당 레이어에 존재하는지 확인
+            if self.node_levels[c_id] < layer {
+                continue;
+            }
+
+            for &neighbor in &self.neighbors[c_id][layer] {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                let dist = self.distance_internal(query, &self.vectors[neighbor], metric);
+                let f_dist = results.peek().map(|&(FloatOrd(d), _)| d).unwrap_or(f64::MAX);
+
+                if results.len() < ef || dist < f_dist {
+                    candidates.push(Reverse((FloatOrd(dist), neighbor)));
+                    results.push((FloatOrd(dist), neighbor));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+
+        let mut result_vec: Vec<(f64, usize)> = results
+            .into_iter()
+            .map(|(FloatOrd(d), id)| (d, id))
+            .collect();
+        result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        result_vec
+    }
+
+    /// 후보 중 가장 가까운 m개 선택 (단순 선택)
+    fn select_neighbors(candidates: &[(f64, usize)], m: usize) -> Vec<usize> {
+        candidates.iter().take(m).map(|&(_, id)| id).collect()
+    }
+
+    /// 벡터 삽입 (HNSW 그래프 구축)
+    ///
+    /// 1. 랜덤 레이어 l 할당
+    /// 2. 최상위 → l+1: greedy search (ef=1)
+    /// 3. l → 0: ef_construction 빔서치 → M개 이웃 양방향 연결
+    /// 4. l > max_level이면 entry point 갱신
+    pub fn add(&mut self, vector: &[f64], label: &str) {
+        debug_assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
+
+        let node_id = self.vectors.len();
+        self.vectors.push(vector.to_vec());
+        self.labels.push(label.to_string());
+
+        let level = self.random_level();
+        self.node_levels.push(level);
+        self.neighbors.push(vec![Vec::new(); level + 1]);
+
+        // 첫 번째 노드
+        if self.entry_point.is_none() {
+            self.entry_point = Some(node_id);
+            self.max_level = level;
+            return;
+        }
+
+        let ep = self.entry_point.unwrap();
+        let metric = Metric::L2;
+
+        // Phase 1: 최상위 → level+1 — greedy (ef=1)
+        let mut current_ep = ep;
+        if level < self.max_level {
+            for lc in ((level + 1)..=self.max_level).rev() {
+                let result = self.search_layer(vector, &[current_ep], 1, lc, metric);
+                if !result.is_empty() {
+                    current_ep = result[0].1;
+                }
+            }
+        }
+
+        // Phase 2: min(level, max_level) → 0 — 이웃 연결
+        let insert_top = level.min(self.max_level);
+        let mut ep_list = vec![current_ep];
+
+        for lc in (0..=insert_top).rev() {
+            let m_max = if lc == 0 { self.m_max0 } else { self.m };
+
+            let candidates = self.search_layer(vector, &ep_list, self.ef_construction, lc, metric);
+            let selected = Self::select_neighbors(&candidates, m_max);
+
+            // node_id → selected (정방향)
+            self.neighbors[node_id][lc] = selected.clone();
+
+            // selected → node_id (역방향, 오버플로 시 pruning)
+            for &neighbor_id in &selected {
+                self.neighbors[neighbor_id][lc].push(node_id);
+                if self.neighbors[neighbor_id][lc].len() > m_max {
+                    // 거리 계산 후 가장 먼 것 제거
+                    let nv = self.vectors[neighbor_id].clone();
+                    let mut dists: Vec<(f64, usize)> = self.neighbors[neighbor_id][lc]
+                        .iter()
+                        .map(|&nid| (l2_distance(&nv, &self.vectors[nid]), nid))
+                        .collect();
+                    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    dists.truncate(m_max);
+                    self.neighbors[neighbor_id][lc] = dists.iter().map(|&(_, id)| id).collect();
+                }
+            }
+
+            ep_list = candidates.iter().map(|&(_, id)| id).collect();
+        }
+
+        // entry point 갱신
+        if level > self.max_level {
+            self.entry_point = Some(node_id);
+            self.max_level = level;
+        }
+    }
+
+    /// 배치 벡터 추가 (순차 삽입)
+    pub fn add_batch(&mut self, vectors: &ArrayD<f64>, labels: &[String]) {
+        let shape = vectors.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array, got {}D", shape.len());
+        let n = shape[0];
+        let d = shape[1];
+        assert_eq!(d, self.dim, "dimension mismatch");
+        assert_eq!(n, labels.len(), "vector count != label count");
+
+        for i in 0..n {
+            let row: Vec<f64> = (0..d).map(|j| vectors[[i, j]]).collect();
+            self.add(&row, &labels[i]);
+        }
+    }
+
+    /// HNSW 검색
+    ///
+    /// - query: 쿼리 벡터
+    /// - k: 반환할 최근접 이웃 수
+    /// - ef_search: 후보 집합 크기 (≥ k). 클수록 recall↑ 속도↓.
+    /// - metric: 유사도/거리 메트릭
+    ///
+    /// 반환: Vec<(인덱스, 점수, 라벨)>
+    pub fn search(
+        &self,
+        query: &[f64],
+        k: usize,
+        ef_search: usize,
+        metric: Metric,
+    ) -> Vec<(usize, f64, String)> {
+        debug_assert_eq!(query.len(), self.dim, "query dimension mismatch");
+
+        if self.vectors.is_empty() || self.entry_point.is_none() {
+            return Vec::new();
+        }
+
+        let ep = self.entry_point.unwrap();
+        let ef_search = ef_search.max(k);
+
+        // Phase 1: 최상위 → layer 1 — greedy (ef=1)
+        let mut current_ep = ep;
+        for lc in (1..=self.max_level).rev() {
+            let result = self.search_layer(query, &[current_ep], 1, lc, metric);
+            if !result.is_empty() {
+                current_ep = result[0].1;
+            }
+        }
+
+        // Phase 2: layer 0 — ef_search 빔서치
+        let candidates = self.search_layer(query, &[current_ep], ef_search, 0, metric);
+
+        let k = k.min(candidates.len());
+        let mut results: Vec<(usize, f64, String)> = candidates[..k]
+            .iter()
+            .map(|&(dist, id)| {
+                let score = match metric {
+                    Metric::L2 | Metric::L1 => dist,
+                    Metric::Cosine | Metric::DotProduct => -dist,
+                };
+                (id, score, self.labels[id].clone())
+            })
+            .collect();
+
+        match metric {
+            Metric::Cosine | Metric::DotProduct => {
+                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            Metric::L2 | Metric::L1 => {
+                results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
+        results
+    }
+
+    /// 배치 쿼리
+    pub fn batch_search(
+        &self,
+        queries: &ArrayD<f64>,
+        k: usize,
+        ef_search: usize,
+        metric: Metric,
+    ) -> Vec<Vec<(usize, f64, String)>> {
+        let shape = queries.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array");
+        assert_eq!(shape[1], self.dim, "dimension mismatch");
+        (0..shape[0])
+            .map(|i| {
+                let row: Vec<f64> = (0..shape[1]).map(|j| queries[[i, j]]).collect();
+                self.search(&row, k, ef_search, metric)
+            })
+            .collect()
+    }
+
+    /// 그래프 통계: Vec<(layer, node_count, avg_connections)>
+    pub fn graph_stats(&self) -> Vec<(usize, usize, f64)> {
+        if self.vectors.is_empty() {
+            return Vec::new();
+        }
+        let mut stats = Vec::new();
+        for layer in 0..=self.max_level {
+            let mut node_count = 0;
+            let mut total_conn = 0;
+            for (nid, &level) in self.node_levels.iter().enumerate() {
+                if level >= layer {
+                    node_count += 1;
+                    total_conn += self.neighbors[nid][layer].len();
+                }
+            }
+            let avg = if node_count > 0 { total_conn as f64 / node_count as f64 } else { 0.0 };
+            stats.push((layer, node_count, avg));
+        }
+        stats
+    }
+
+    pub fn len(&self) -> usize { self.vectors.len() }
+    pub fn is_empty(&self) -> bool { self.vectors.is_empty() }
+    pub fn dim(&self) -> usize { self.dim }
+    pub fn m(&self) -> usize { self.m }
+    pub fn ef_construction(&self) -> usize { self.ef_construction }
+    pub fn max_level(&self) -> usize { self.max_level }
+    pub fn entry_point(&self) -> Option<usize> { self.entry_point }
 }
 
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
