@@ -814,6 +814,31 @@ impl Function for LogFn {
     fn name(&self) -> &str { "Log" }
 }
 
+/// Clamp: 값을 [min, max] 범위로 제한
+/// 범위 내 값은 gradient가 그대로 통과, 범위 밖은 0
+struct ClampFn {
+    min_val: f64,
+    max_val: f64,
+}
+
+impl Function for ClampFn {
+    fn forward(&self, xs: &[ArrayD<f64>]) -> Vec<ArrayD<f64>> {
+        vec![xs[0].mapv(|v| v.clamp(self.min_val, self.max_val))]
+    }
+    fn backward(&self, xs: &[Variable], gys: &[Variable]) -> Vec<Variable> {
+        let x = xs[0].data();
+        let mask = x.mapv(|v| {
+            if v > self.min_val && v < self.max_val { 1.0 } else { 0.0 }
+        });
+        vec![&gys[0] * &Variable::new(mask)]
+    }
+    fn name(&self) -> &str { "Clamp" }
+}
+
+pub fn clamp(x: &Variable, min_val: f64, max_val: f64) -> Variable {
+    Func::new(ClampFn { min_val, max_val }).call(&[x])
+}
+
 /// Softmax Cross-Entropy: 분류 문제의 손실 함수
 /// softmax로 확률 변환 후 정답 클래스의 -log(확률)의 평균
 /// softmax와 cross-entropy를 하나로 합쳐서 수치적으로 안정
@@ -1835,6 +1860,19 @@ pub fn mean_squared_error(x0: &Variable, x1: &Variable) -> Variable {
     let diff = x0 - x1;
     let n = diff.len();
     &sum(&diff.pow(2.0)) / (n as f64)
+}
+
+/// Binary Cross-Entropy: -mean(t * log(p) + (1-t) * log(1-p))
+/// p: sigmoid 출력 (예측 확률, 0~1)
+/// t: 타겟 라벨 (0 또는 1)
+/// 수치 안정성을 위해 p를 [eps, 1-eps]로 clamp
+pub fn binary_cross_entropy(p: &Variable, t: &Variable) -> Variable {
+    let eps = 1e-7;
+    let p_clamped = clamp(p, eps, 1.0 - eps);
+    let n = p.len() as f64;
+    let term1 = t * &log(&p_clamped);
+    let term2 = &(1.0 - t) * &log(&(1.0 - &p_clamped));
+    &sum(&(&term1 + &term2)) * (-1.0 / n)
 }
 
 // --- 레이어 ---
@@ -5326,6 +5364,151 @@ impl VAE {
         p.extend(self.decoder_h.params());
         p.extend(self.decoder_out.params());
         p
+    }
+}
+
+// --- GAN (Generative Adversarial Network) ---
+
+/// GAN 손실 계산
+/// 반환: (d_loss, g_loss)
+///
+/// D loss = bce(D(x_real), 1) + bce(D(G(z)), 0)
+/// G loss = bce(D(G(z)), 1) — non-saturating variant
+pub fn gan_loss(d_real: &Variable, d_fake: &Variable) -> (Variable, Variable) {
+    let batch_real = d_real.shape()[0];
+    let batch_fake = d_fake.shape()[0];
+
+    let ones_real = Variable::new(ArrayD::ones(ndarray::IxDyn(&[batch_real, 1])));
+    let zeros_fake = Variable::new(ArrayD::zeros(ndarray::IxDyn(&[batch_fake, 1])));
+    let ones_fake = Variable::new(ArrayD::ones(ndarray::IxDyn(&[batch_fake, 1])));
+
+    let d_loss_real = binary_cross_entropy(d_real, &ones_real);
+    let d_loss_fake = binary_cross_entropy(d_fake, &zeros_fake);
+    let d_loss = &d_loss_real + &d_loss_fake;
+
+    let g_loss = binary_cross_entropy(d_fake, &ones_fake);
+
+    (d_loss, g_loss)
+}
+
+/// GAN (Generative Adversarial Network) — 적대적 생성 모델
+///
+/// Generator: z → tanh(h1) → tanh(h2) → sigmoid(out) → 가짜 데이터
+/// Discriminator: x → tanh(h1) → tanh(h2) → sigmoid(out) → 진짜/가짜 확률
+///
+/// 학습: D와 G를 교대로 학습 (별도 optimizer)
+pub struct GAN {
+    g_l1: Linear,
+    g_l2: Linear,
+    g_out: Linear,
+    d_l1: Linear,
+    d_l2: Linear,
+    d_out: Linear,
+    pub latent_dim: usize,
+    pub data_dim: usize,
+    rng_state: Cell<u64>,
+}
+
+impl GAN {
+    /// GAN 생성
+    /// - data_dim: 실제 데이터 차원
+    /// - latent_dim: noise 차원 (z의 크기)
+    /// - g_hidden: Generator 은닉층 크기
+    /// - d_hidden: Discriminator 은닉층 크기
+    /// - seed: PRNG 시드
+    pub fn new(
+        data_dim: usize, latent_dim: usize,
+        g_hidden: usize, d_hidden: usize, seed: u64,
+    ) -> Self {
+        GAN {
+            g_l1: Linear::new(g_hidden, seed),
+            g_l2: Linear::new(g_hidden, seed.wrapping_add(1)),
+            g_out: Linear::new(data_dim, seed.wrapping_add(2)),
+            d_l1: Linear::new(d_hidden, seed.wrapping_add(3)),
+            d_l2: Linear::new(d_hidden, seed.wrapping_add(4)),
+            d_out: Linear::new(1, seed.wrapping_add(5)),
+            latent_dim,
+            data_dim,
+            rng_state: Cell::new(seed.wrapping_add(6)),
+        }
+    }
+
+    fn next_f64(&self) -> f64 {
+        let state = self.rng_state.get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state.set(state);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_normal(&self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Generator forward: z → tanh(l1) → tanh(l2) → sigmoid(out)
+    pub fn generator_forward(&self, z: &Variable) -> Variable {
+        let h1 = tanh(&self.g_l1.forward(z));
+        let h2 = tanh(&self.g_l2.forward(&h1));
+        sigmoid(&self.g_out.forward(&h2))
+    }
+
+    /// 랜덤 noise에서 가짜 데이터 생성
+    pub fn generate(&self, num_samples: usize) -> Variable {
+        let z_data: Vec<f64> = (0..num_samples * self.latent_dim)
+            .map(|_| self.next_normal())
+            .collect();
+        let z = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[num_samples, self.latent_dim]), z_data).unwrap(),
+        );
+        self.generator_forward(&z)
+    }
+
+    /// Discriminator forward: x → tanh(l1) → tanh(l2) → sigmoid(out)
+    pub fn discriminate(&self, x: &Variable) -> Variable {
+        let h1 = tanh(&self.d_l1.forward(x));
+        let h2 = tanh(&self.d_l2.forward(&h1));
+        sigmoid(&self.d_out.forward(&h2))
+    }
+
+    pub fn generator_params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.g_l1.params());
+        p.extend(self.g_l2.params());
+        p.extend(self.g_out.params());
+        p
+    }
+
+    pub fn discriminator_params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.d_l1.params());
+        p.extend(self.d_l2.params());
+        p.extend(self.d_out.params());
+        p
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = self.generator_params();
+        p.extend(self.discriminator_params());
+        p
+    }
+
+    pub fn cleargrads_generator(&self) {
+        self.g_l1.cleargrads();
+        self.g_l2.cleargrads();
+        self.g_out.cleargrads();
+    }
+
+    pub fn cleargrads_discriminator(&self) {
+        self.d_l1.cleargrads();
+        self.d_l2.cleargrads();
+        self.d_out.cleargrads();
+    }
+
+    pub fn cleargrads(&self) {
+        self.cleargrads_generator();
+        self.cleargrads_discriminator();
     }
 }
 
