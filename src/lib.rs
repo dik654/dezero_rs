@@ -4584,6 +4584,227 @@ impl IVFIndex {
     }
 }
 
+/// Product Quantization (PQ) 벡터 검색 인덱스
+///
+/// D차원 벡터를 M개 서브벡터(각 D/M차원)로 분할하고, 각 서브공간에서
+/// 독립적으로 K'개 중심으로 양자화. 원본 벡터 대신 M바이트 코드만 저장.
+/// 메모리: N·D·8 바이트(f64) → N·M + M·K'·(D/M)·8 바이트.
+///
+/// 검색: ADC (Asymmetric Distance Computation)
+///   1. 쿼리의 서브벡터와 코드북 중심 간 거리 테이블 [M][K'] 사전 계산
+///   2. 각 DB 벡터(M바이트 코드)에 대해 테이블 룩업 M번 → 근사 squared L2 거리
+///   3. O(M·K'·ds + N·M) per query (vs O(N·D) brute force)
+///
+/// 점수는 squared L2 거리 (낮을수록 유사). 쿼리는 양자화하지 않음(비대칭).
+pub struct PQIndex {
+    dim: usize,                        // 전체 벡터 차원 D
+    n_sub: usize,                      // 서브벡터 개수 M (D가 M으로 나누어져야 함)
+    n_sub_clusters: usize,             // 서브공간별 클러스터 수 K' (≤256, u8 범위)
+    sub_dim: usize,                    // 서브벡터 차원 ds = D / M
+    codebooks: Vec<Vec<Vec<f64>>>,     // [M][K'][ds] — M개 코드북, 각 K'개 중심
+    codes: Vec<Vec<u8>>,               // [N][M] — 양자화된 코드 (각 벡터 = M바이트)
+    labels: Vec<String>,               // [N] — 벡터 라벨
+    is_trained: bool,
+}
+
+impl PQIndex {
+    /// PQ 인덱스 생성
+    ///
+    /// dim: 전체 차원, n_sub: 서브벡터 수(M), n_sub_clusters: 서브공간별 클러스터 수(K')
+    /// dim은 n_sub으로 나누어져야 하고, n_sub_clusters ≤ 256 (u8 코드)
+    pub fn new(dim: usize, n_sub: usize, n_sub_clusters: usize) -> Self {
+        assert!(dim > 0, "PQIndex: dim must be > 0");
+        assert!(n_sub > 0, "PQIndex: n_sub must be > 0");
+        assert!(dim % n_sub == 0, "PQIndex: dim={} must be divisible by n_sub={}", dim, n_sub);
+        assert!(n_sub_clusters > 0 && n_sub_clusters <= 256,
+            "PQIndex: n_sub_clusters={} must be in [1, 256]", n_sub_clusters);
+
+        PQIndex {
+            dim,
+            n_sub,
+            n_sub_clusters,
+            sub_dim: dim / n_sub,
+            codebooks: Vec::new(),
+            codes: Vec::new(),
+            labels: Vec::new(),
+            is_trained: false,
+        }
+    }
+
+    /// 훈련 벡터로 M개 코드북 학습 (각 서브공간에서 독립 K-means)
+    pub fn train(&mut self, vectors: &[&[f64]], max_iter: usize, seed: u64) {
+        assert!(!vectors.is_empty(), "PQIndex train: need at least 1 vector");
+        assert!(vectors.len() >= self.n_sub_clusters,
+            "PQIndex train: need at least n_sub_clusters={} vectors, got {}",
+            self.n_sub_clusters, vectors.len());
+
+        let mut codebooks = Vec::with_capacity(self.n_sub);
+
+        for m in 0..self.n_sub {
+            let start = m * self.sub_dim;
+            let end = start + self.sub_dim;
+
+            // 서브벡터 추출
+            let sub_vecs: Vec<Vec<f64>> = vectors.iter()
+                .map(|v| v[start..end].to_vec())
+                .collect();
+            let sub_refs: Vec<&[f64]> = sub_vecs.iter().map(|v| v.as_slice()).collect();
+
+            // 서브공간별 K-means (seed 변형으로 각 서브공간마다 다른 초기화)
+            let seed_m = seed.wrapping_add(m as u64);
+            let (centroids, _) = kmeans(&sub_refs, self.n_sub_clusters, max_iter, seed_m);
+            codebooks.push(centroids);
+        }
+
+        self.codebooks = codebooks;
+        self.is_trained = true;
+    }
+
+    /// 벡터를 M바이트 코드로 인코딩 (각 서브공간에서 nearest centroid index)
+    pub fn encode(&self, vector: &[f64]) -> Vec<u8> {
+        assert!(self.is_trained, "PQIndex: must call train() before encode()");
+        debug_assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
+
+        let mut code = Vec::with_capacity(self.n_sub);
+        for m in 0..self.n_sub {
+            let start = m * self.sub_dim;
+            let sub = &vector[start..start + self.sub_dim];
+
+            let mut best_c = 0u8;
+            let mut best_dist = f64::MAX;
+            for (c, centroid) in self.codebooks[m].iter().enumerate() {
+                let dist = l2_distance(sub, centroid);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_c = c as u8;
+                }
+            }
+            code.push(best_c);
+        }
+        code
+    }
+
+    /// M바이트 코드를 복원 벡터로 디코딩 (각 서브벡터를 해당 중심으로 대체)
+    pub fn decode(&self, code: &[u8]) -> Vec<f64> {
+        assert!(self.is_trained, "PQIndex: must call train() before decode()");
+        assert_eq!(code.len(), self.n_sub, "code length mismatch: expected {}, got {}", self.n_sub, code.len());
+
+        let mut vec = Vec::with_capacity(self.dim);
+        for m in 0..self.n_sub {
+            vec.extend_from_slice(&self.codebooks[m][code[m] as usize]);
+        }
+        vec
+    }
+
+    /// 단일 벡터를 양자화하여 코드로 저장 (원본 벡터는 저장하지 않음)
+    pub fn add(&mut self, vector: &[f64], label: &str) {
+        assert!(self.is_trained, "PQIndex: must call train() before add()");
+        debug_assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
+
+        let code = self.encode(vector);
+        self.codes.push(code);
+        self.labels.push(label.to_string());
+    }
+
+    /// 배치 벡터 추가
+    pub fn add_batch(&mut self, vectors: &ArrayD<f64>, labels: &[String]) {
+        assert!(self.is_trained, "PQIndex: must call train() before add_batch()");
+        let shape = vectors.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array, got {}D", shape.len());
+        let n = shape[0];
+        let d = shape[1];
+        assert_eq!(d, self.dim, "dimension mismatch");
+        assert_eq!(n, labels.len(), "vector count != label count");
+
+        for i in 0..n {
+            let row: Vec<f64> = (0..d).map(|j| vectors[[i, j]]).collect();
+            self.add(&row, &labels[i]);
+        }
+    }
+
+    /// ADC (Asymmetric Distance Computation) 기반 근사 검색
+    ///
+    /// 반환값의 score는 squared L2 거리 (낮을수록 유사).
+    /// 쿼리는 양자화하지 않고 원본 서브벡터 사용 (비대칭).
+    pub fn search(&self, query: &[f64], k: usize) -> Vec<(usize, f64, String)> {
+        assert!(self.is_trained, "PQIndex: must call train() before search()");
+        debug_assert_eq!(query.len(), self.dim, "query dimension mismatch");
+
+        if self.codes.is_empty() {
+            return Vec::new();
+        }
+
+        // 1. 거리 테이블 구축: dist_table[m][j] = ||q_m - c_m_j||²
+        let mut dist_table: Vec<Vec<f64>> = Vec::with_capacity(self.n_sub);
+        for m in 0..self.n_sub {
+            let start = m * self.sub_dim;
+            let q_sub = &query[start..start + self.sub_dim];
+
+            let table: Vec<f64> = self.codebooks[m].iter().map(|centroid| {
+                // squared L2 (sqrt 생략 — 순서 보존)
+                q_sub.iter().zip(centroid.iter())
+                    .map(|(a, b)| { let d = a - b; d * d })
+                    .sum()
+            }).collect();
+            dist_table.push(table);
+        }
+
+        // 2. ADC: 각 코드에 대해 테이블 룩업 합산
+        let mut scores: Vec<(usize, f64)> = self.codes.iter().enumerate().map(|(i, code)| {
+            let dist: f64 = (0..self.n_sub)
+                .map(|m| dist_table[m][code[m] as usize])
+                .sum();
+            (i, dist)
+        }).collect();
+
+        // 3. 오름차순 정렬 (squared L2: 낮을수록 유사)
+        scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let k = k.min(scores.len());
+        scores[..k].iter().map(|&(i, score)| {
+            (i, score, self.labels[i].clone())
+        }).collect()
+    }
+
+    /// 배치 쿼리
+    pub fn batch_search(&self, queries: &ArrayD<f64>, k: usize) -> Vec<Vec<(usize, f64, String)>> {
+        let shape = queries.shape();
+        assert_eq!(shape.len(), 2, "expected 2D array");
+        assert_eq!(shape[1], self.dim, "dimension mismatch");
+
+        let q = shape[0];
+        (0..q).map(|i| {
+            let row: Vec<f64> = (0..shape[1]).map(|j| queries[[i, j]]).collect();
+            self.search(&row, k)
+        }).collect()
+    }
+
+    pub fn len(&self) -> usize { self.codes.len() }
+    pub fn is_empty(&self) -> bool { self.codes.is_empty() }
+    pub fn dim(&self) -> usize { self.dim }
+    pub fn is_trained(&self) -> bool { self.is_trained }
+    pub fn n_sub(&self) -> usize { self.n_sub }
+    pub fn n_sub_clusters(&self) -> usize { self.n_sub_clusters }
+
+    /// i번째 벡터의 양자화 코드
+    pub fn get_code(&self, index: usize) -> &[u8] {
+        &self.codes[index]
+    }
+
+    /// 메모리 사용량 비교: (원본 바이트, 압축 바이트, 압축률)
+    ///
+    /// 원본: N * D * 8 (f64), 압축: N * M + M * K' * ds * 8 (코드 + 코드북)
+    pub fn memory_stats(&self) -> (usize, usize, f64) {
+        let n = self.codes.len();
+        let original = n * self.dim * 8;
+        let codebook_size = self.n_sub * self.n_sub_clusters * self.sub_dim * 8;
+        let codes_size = n * self.n_sub;
+        let compressed = codes_size + codebook_size;
+        let ratio = if original > 0 { compressed as f64 / original as f64 } else { 0.0 };
+        (original, compressed, ratio)
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
