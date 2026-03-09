@@ -5512,6 +5512,266 @@ impl GAN {
     }
 }
 
+// --- DDPM (Denoising Diffusion Probabilistic Models) ---
+
+/// DDPM 손실 계산: ε-prediction 목적함수
+/// L = ||ε - ε_θ(x_t, t)||²
+///
+/// 내부에서 q_sample으로 x_0에 noise를 추가하고,
+/// denoiser가 그 noise를 예측하도록 MSE 학습.
+pub fn ddpm_loss(ddpm: &DDPM, x_0: &Variable, t: &[usize]) -> Variable {
+    let (x_t, noise) = ddpm.q_sample(x_0, t);
+    let predicted = ddpm.forward(&x_t, t);
+    mean_squared_error(&predicted, &noise)
+}
+
+/// DDPM (Denoising Diffusion Probabilistic Models)
+///
+/// Forward diffusion: 데이터에 점진적으로 noise 추가 (q_sample)
+/// Reverse denoising: 학습된 네트워크로 noise 제거 (p_sample)
+///
+/// Denoiser: MLP with additive sinusoidal time injection
+///   t_emb → GELU(t_mlp1) → t_mlp2 → t_hidden
+///   h = GELU(x_proj(x_t) + t_hidden)
+///   h = GELU(block1(h) + t_hidden)
+///   h = GELU(block2(h) + t_hidden)
+///   out_proj(h) → predicted noise
+pub struct DDPM {
+    // Time embedding MLP
+    t_mlp1: Linear,
+    t_mlp2: Linear,
+    // Denoiser network
+    x_proj: Linear,
+    block1: Linear,
+    block2: Linear,
+    out_proj: Linear,
+    // 사전 계산된 noise schedule
+    betas: Vec<f64>,
+    pub alphas_cumprod: Vec<f64>,
+    sqrt_alphas_cumprod: Vec<f64>,
+    sqrt_one_minus_alphas_cumprod: Vec<f64>,
+    posterior_variance: Vec<f64>,
+    // Config
+    pub data_dim: usize,
+    pub timesteps: usize,
+    t_emb_dim: usize,
+    rng_state: Cell<u64>,
+}
+
+impl DDPM {
+    /// DDPM 생성 (linear β schedule)
+    /// - data_dim: 데이터 차원
+    /// - hidden_dim: 은닉층 크기 (= t_emb_dim)
+    /// - timesteps: 확산 스텝 수 T
+    /// - seed: PRNG 시드
+    pub fn new(data_dim: usize, hidden_dim: usize, timesteps: usize, seed: u64) -> Self {
+        // Linear β schedule: β_start=1e-4, β_end=0.02
+        let beta_start = 1e-4_f64;
+        let beta_end = 0.02_f64;
+        let betas: Vec<f64> = (0..timesteps)
+            .map(|t| beta_start + (beta_end - beta_start) * t as f64 / (timesteps - 1) as f64)
+            .collect();
+
+        // α_t = 1 - β_t, ᾱ_t = ∏ α_i
+        let alphas: Vec<f64> = betas.iter().map(|b| 1.0 - b).collect();
+        let mut alphas_cumprod = vec![0.0; timesteps];
+        alphas_cumprod[0] = alphas[0];
+        for t in 1..timesteps {
+            alphas_cumprod[t] = alphas_cumprod[t - 1] * alphas[t];
+        }
+
+        let sqrt_alphas_cumprod: Vec<f64> = alphas_cumprod.iter().map(|a| a.sqrt()).collect();
+        let sqrt_one_minus_alphas_cumprod: Vec<f64> =
+            alphas_cumprod.iter().map(|a| (1.0 - a).sqrt()).collect();
+
+        // Posterior variance: β̃_t = β_t · (1-ᾱ_{t-1}) / (1-ᾱ_t)
+        let mut posterior_variance = vec![0.0; timesteps];
+        posterior_variance[0] = betas[0]; // t=0은 p_sample에서 사용 안 함
+        for t in 1..timesteps {
+            posterior_variance[t] =
+                betas[t] * (1.0 - alphas_cumprod[t - 1]) / (1.0 - alphas_cumprod[t]);
+        }
+
+        DDPM {
+            t_mlp1: Linear::new(hidden_dim, seed),
+            t_mlp2: Linear::new(hidden_dim, seed.wrapping_add(1)),
+            x_proj: Linear::new(hidden_dim, seed.wrapping_add(2)),
+            block1: Linear::new(hidden_dim, seed.wrapping_add(3)),
+            block2: Linear::new(hidden_dim, seed.wrapping_add(4)),
+            out_proj: Linear::new(data_dim, seed.wrapping_add(5)),
+            betas,
+            alphas_cumprod,
+            sqrt_alphas_cumprod,
+            sqrt_one_minus_alphas_cumprod,
+            posterior_variance,
+            data_dim,
+            timesteps,
+            t_emb_dim: hidden_dim,
+            rng_state: Cell::new(seed.wrapping_add(6)),
+        }
+    }
+
+    fn next_f64(&self) -> f64 {
+        let state = self.rng_state.get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state.set(state);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_normal(&self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Sinusoidal time embedding: [B, t_emb_dim]
+    /// PE(t, 2k) = sin(t / 10000^(k/half_dim))
+    /// PE(t, 2k+1) = cos(t / 10000^(k/half_dim))
+    pub fn sinusoidal_embedding(&self, t: &[usize]) -> Variable {
+        let batch = t.len();
+        let half = self.t_emb_dim / 2;
+        let mut data = vec![0.0f64; batch * self.t_emb_dim];
+
+        for (i, &ti) in t.iter().enumerate() {
+            for k in 0..half {
+                let freq = 1.0 / (10000.0_f64).powf(k as f64 / half as f64);
+                let angle = ti as f64 * freq;
+                data[i * self.t_emb_dim + 2 * k] = angle.sin();
+                data[i * self.t_emb_dim + 2 * k + 1] = angle.cos();
+            }
+        }
+
+        Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[batch, self.t_emb_dim]), data).unwrap(),
+        )
+    }
+
+    /// Denoiser forward: x_t와 timestep t로부터 noise 예측
+    pub fn forward(&self, x_t: &Variable, t: &[usize]) -> Variable {
+        // Time embedding → MLP
+        let t_emb = self.sinusoidal_embedding(t);
+        let t_hidden = self.t_mlp2.forward(&gelu(&self.t_mlp1.forward(&t_emb)));
+
+        // Main path with additive time injection
+        let h = gelu(&(&self.x_proj.forward(x_t) + &t_hidden));
+        let h = gelu(&(&self.block1.forward(&h) + &t_hidden));
+        let h = gelu(&(&self.block2.forward(&h) + &t_hidden));
+        self.out_proj.forward(&h)
+    }
+
+    /// Forward diffusion: x_0에 noise 추가하여 x_t 생성
+    /// x_t = √ᾱ_t · x_0 + √(1-ᾱ_t) · ε
+    /// 반환: (x_t, ε)
+    pub fn q_sample(&self, x_0: &Variable, t: &[usize]) -> (Variable, Variable) {
+        let batch = t.len();
+        let data_dim = x_0.shape()[1];
+
+        // Per-sample coefficients: [B, 1] → broadcast와 연산
+        let sqrt_ac: Vec<f64> = t.iter().map(|&ti| self.sqrt_alphas_cumprod[ti]).collect();
+        let sqrt_ac_var = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[batch, 1]), sqrt_ac).unwrap(),
+        );
+
+        let sqrt_omc: Vec<f64> = t
+            .iter()
+            .map(|&ti| self.sqrt_one_minus_alphas_cumprod[ti])
+            .collect();
+        let sqrt_omc_var = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[batch, 1]), sqrt_omc).unwrap(),
+        );
+
+        // ε ~ N(0, I): [B, data_dim]
+        let noise_data: Vec<f64> = (0..batch * data_dim)
+            .map(|_| self.next_normal())
+            .collect();
+        let noise = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[batch, data_dim]), noise_data).unwrap(),
+        );
+
+        // x_t = √ᾱ_t · x_0 + √(1-ᾱ_t) · ε
+        let x_t = &(&sqrt_ac_var * x_0) + &(&sqrt_omc_var * &noise);
+        (x_t, noise)
+    }
+
+    /// Reverse denoising 한 스텝 (sampling용, no_grad)
+    /// μ = (1/√α_t)(x_t - β_t/√(1-ᾱ_t) · ε_θ)
+    pub fn p_sample(&self, x_t: &Variable, t: usize) -> Variable {
+        let _guard = no_grad();
+        let batch = x_t.shape()[0];
+        let t_vec = vec![t; batch];
+
+        let predicted_noise = self.forward(x_t, &t_vec);
+
+        let beta_t = self.betas[t];
+        let alpha_t = 1.0 - beta_t;
+        let sqrt_recip_alpha = 1.0 / alpha_t.sqrt();
+        let coeff = beta_t / self.sqrt_one_minus_alphas_cumprod[t];
+
+        // μ = (1/√α_t)(x_t - coeff · ε_θ)
+        let mean = &(x_t - &(&predicted_noise * coeff)) * sqrt_recip_alpha;
+
+        if t == 0 {
+            mean
+        } else {
+            let sigma = self.posterior_variance[t].sqrt();
+            let z_data: Vec<f64> = (0..batch * self.data_dim)
+                .map(|_| self.next_normal())
+                .collect();
+            let z = Variable::new(
+                ArrayD::from_shape_vec(ndarray::IxDyn(&[batch, self.data_dim]), z_data).unwrap(),
+            );
+            &mean + &(&z * sigma)
+        }
+    }
+
+    /// 전체 reverse process: x_T ~ N(0,I) → x_0
+    pub fn sample(&self, num_samples: usize) -> Variable {
+        let _guard = no_grad();
+        let x_data: Vec<f64> = (0..num_samples * self.data_dim)
+            .map(|_| self.next_normal())
+            .collect();
+        let mut x = Variable::new(
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[num_samples, self.data_dim]), x_data).unwrap(),
+        );
+
+        for t in (0..self.timesteps).rev() {
+            x = self.p_sample(&x, t);
+        }
+        x
+    }
+
+    /// 배치에 대해 uniform 랜덤 timestep 선택
+    pub fn sample_timesteps(&self, batch_size: usize) -> Vec<usize> {
+        (0..batch_size)
+            .map(|_| {
+                let u = self.next_f64();
+                (u * self.timesteps as f64) as usize
+            })
+            .collect()
+    }
+
+    pub fn params(&self) -> Vec<Variable> {
+        let mut p = Vec::new();
+        p.extend(self.t_mlp1.params());
+        p.extend(self.t_mlp2.params());
+        p.extend(self.x_proj.params());
+        p.extend(self.block1.params());
+        p.extend(self.block2.params());
+        p.extend(self.out_proj.params());
+        p
+    }
+
+    pub fn cleargrads(&self) {
+        self.t_mlp1.cleargrads();
+        self.t_mlp2.cleargrads();
+        self.x_proj.cleargrads();
+        self.block1.cleargrads();
+        self.block2.cleargrads();
+        self.out_proj.cleargrads();
+    }
+}
+
 // --- 계산 그래프 시각화 (DOT/Graphviz) ---
 
 /// Variable 노드의 DOT 표현
